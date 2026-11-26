@@ -1,0 +1,12 @@
+services:
+  artex:
+    ports: !override
+      - "127.0.0.1:8797:8787"
+      - "127.0.0.1:8798:8788"
+    # Sliver server runs on the WSL host; the client inside this container
+    # reaches its multiplayer listener through the Docker host gateway.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Custom tools run as uid 10001; give their CLIs a writable home.
+    environment:
+      HOME: /tmp

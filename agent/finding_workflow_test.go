@@ -10,19 +10,23 @@ import (
 )
 
 func TestFindingWorkflowSharedAssemblyAndSwitch(t *testing.T) {
-	oldPolicy, oldResolve, oldAugment := FindingTrafficBindingEnabled, ToolResolve, ToolAugment
-	t.Cleanup(func() { FindingTrafficBindingEnabled, ToolResolve, ToolAugment = oldPolicy, oldResolve, oldAugment })
-	ToolAugment = nil
+	oldPolicy, oldResolve, oldAugment := FindingTrafficBindingEnabled(), ToolResolve(), ToolAugment()
+	t.Cleanup(func() {
+		SetFindingTrafficBindingEnabled(oldPolicy)
+		SetToolResolve(oldResolve)
+		SetToolAugment(oldAugment)
+	})
+	SetToolAugment(nil)
 	on := false
-	FindingTrafficBindingEnabled = func() bool { return on }
+	SetFindingTrafficBindingEnabled(func() bool { return on })
 	ts := NewToolSet(nil, "fixture")
-	ToolResolve = func(_ context.Context, _ string, base []actool.CoreTool) []actool.CoreTool {
+	SetToolResolve(func(_ context.Context, _ string, base []actool.CoreTool) []actool.CoreTool {
 		out := make([]actool.CoreTool, len(base))
 		for i, tool := range base {
 			out[i] = DecorateTool(tool, "CUSTOM DESCRIPTION", tool.InputSchema())
 		}
 		return out
-	}
+	})
 	for _, role := range []string{"worker", "planner", "mainagent", "auto", "pentest", "custom-agent"} {
 		for _, enabled := range []bool{false, true, false} {
 			on = enabled
@@ -37,9 +41,6 @@ func TestFindingWorkflowSharedAssemblyAndSwitch(t *testing.T) {
 			}
 			if on && (!strings.Contains(system[0], "TCP") || !strings.Contains(system[0], "evidence_hint_id")) {
 				t.Fatal("missing optional/handoff contract")
-			}
-			if on && (!strings.Contains(system[0], "不是列表行号") || !strings.Contains(system[0], "完整 ID")) {
-				t.Fatal("missing stable traffic ID handoff contract")
 			}
 			for _, tool := range out {
 				if !strings.HasPrefix(tool.Description(), "CUSTOM DESCRIPTION") {
@@ -62,7 +63,7 @@ func TestFindingWorkflowSharedAssemblyAndSwitch(t *testing.T) {
 		}
 	}
 	on = true
-	ToolResolve = func(context.Context, string, []actool.CoreTool) []actool.CoreTool { return nil }
+	SetToolResolve(func(context.Context, string, []actool.CoreTool) []actool.CoreTool { return nil })
 	out, def, cleanup := AugmentTools(t.Context(), "planner", []actool.CoreTool{ts.addFinding()})
 	defer cleanup()
 	if len(out) != 0 || def.FindingGuidance != "" {

@@ -3,7 +3,6 @@
 import { useState } from "react";
 
 import { Check, KeyRound, LogOut } from "lucide-react";
-import { useTranslation } from "react-i18next";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
@@ -13,6 +12,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { t } from "@/i18n";
 import { auth } from "@/lib/auth";
 import { cn, getInitials } from "@/lib/utils";
 
@@ -29,7 +29,6 @@ export function AccountSwitcher({
     readonly role: string;
   }>;
 }) {
-  const { t } = useTranslation();
   const [activeUser, setActiveUser] = useState(users[0]);
   const [pwOpen, setPwOpen] = useState(false);
 
@@ -66,7 +65,7 @@ export function AccountSwitcher({
                 </Avatar>
                 <div className="grid min-w-0 flex-1 text-left text-sm leading-tight">
                   <span className="truncate font-semibold">{user.name}</span>
-                  <span className="truncate text-xs capitalize">{user.role}</span>
+                  <span className="truncate text-xs capitalize">{t(user.role)}</span>
                 </div>
                 <span
                   className={cn(
@@ -82,11 +81,11 @@ export function AccountSwitcher({
           <DropdownMenuSeparator />
           <DropdownMenuItem onClick={() => setPwOpen(true)}>
             <KeyRound />
-            {t("account.changePassword")}
+            {t("Change password")}
           </DropdownMenuItem>
           <DropdownMenuItem onClick={handleLogout} className="text-destructive focus:text-destructive">
             <LogOut />
-            {t("account.logout")}
+            {t("Sign out")}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

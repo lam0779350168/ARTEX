@@ -1,26 +1,44 @@
 "use client";
-import * as React from "react";
 
-import { PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, Trash2Icon } from "lucide-react";
+import * as React from "react";
 import { toast } from "sonner";
+import { PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, Trash2Icon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Textarea } from "@/components/ui/textarea";
-import { useUITranslation } from "@/i18n/use-ui-translation";
+import { Separator } from "@/components/ui/separator";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { Agent, Tool } from "@/lib/types";
 
-// Traffic tools are host tools gated by the global 流量捕获 switch: bindable, but
+// Traffic tools are host tools gated by the global traffic capture switch: bindable, but
 // only usable when capture is on. Keep in sync with traffic.SeedToolMetas.
 const TRAFFIC_TOOL_KEYS = new Set(["traffic_search", "traffic_get"]);
 
@@ -47,8 +65,7 @@ function toRows(schema: Record<string, any>): ParamRow[] {
     const type = String(p?.type ?? "");
     const hasDefault = p != null && "default" in p && (p as Record<string, unknown>).default != null;
     rows.push({
-      name,
-      type,
+      name, type,
       required: required.has(name),
       description: String(p?.description ?? ""),
       defaultStr: hasDefault ? String((p as Record<string, unknown>).default) : "",
@@ -65,8 +82,7 @@ function toRows(schema: Record<string, any>): ParamRow[] {
           const subType = String((subP as Record<string, unknown>)?.type ?? "");
           const subHasDefault = subP != null && "default" in subP && subP.default != null;
           rows.push({
-            name: subName,
-            type: subType,
+            name: subName, type: subType,
             required: itemRequired.has(subName),
             description: String(subP?.description ?? ""),
             defaultStr: subHasDefault ? String(subP.default) : "",
@@ -139,9 +155,7 @@ function ToolEditor({
   onSaved: () => void;
   onClose: () => void;
 }) {
-  const { ui } = useUITranslation();
-
-  // traffic tools can't be bound/enabled until the global 流量捕获 switch is on.
+  // traffic tools can't be bound/enabled until the global traffic capture switch is on.
   const trafficGated = TRAFFIC_TOOL_KEYS.has(tool.key) && !captureOn;
   const [description, setDescription] = React.useState(tool.description);
   const [bound, setBound] = React.useState<string[]>(tool.agents);
@@ -151,7 +165,8 @@ function ToolEditor({
 
   const setRow = (i: number, patch: Partial<ParamRow>) =>
     setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const toggleAgent = (k: string) => setBound((b) => (b.includes(k) ? b.filter((x) => x !== k) : [...b, k]));
+  const toggleAgent = (k: string) =>
+    setBound((b) => (b.includes(k) ? b.filter((x) => x !== k) : [...b, k]));
 
   async function save() {
     setSaving(true);
@@ -162,11 +177,11 @@ function ToolEditor({
         agents: bound,
         enabled,
       });
-      toast.success(ui("screen.8465f58cd53be3", { v0: tool.key }));
+      toast.success(t('Tool "{key}" saved', { key: tool.key }));
       onSaved();
       onClose();
     } catch (e) {
-      toast.error(ui("screen.6ade7baf8737c0") + (e as Error).message);
+      toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
       setSaving(false);
     }
@@ -174,11 +189,11 @@ function ToolEditor({
   async function reset() {
     try {
       await api.resetTool(tool.key);
-      toast.success(ui("screen.7d4646712aedf3", { v0: tool.key }));
+      toast.success(t('Restored "{key}" to the code default', { key: tool.key }));
       onSaved();
       onClose();
     } catch (e) {
-      toast.error(ui("screen.288bfb28a85177") + (e as Error).message);
+      toast.error(t("Restore failed: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -187,15 +202,23 @@ function ToolEditor({
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4">
         {trafficGated && (
           <div className="border-amber-500/40 bg-amber-500/10 text-muted-foreground rounded-md border px-3 py-2 text-xs">
-            {ui("screen.3cb2efc9c9f048")}
-            <b>{ui("screen.e81547323360ce")}</b>
-            {ui("screen.f4aeb014f9325f")}
+            {(() => {
+              const [before, after] = t("This tool depends on {capture}.").split("{capture}");
+              return (
+                <>
+                  {before}
+                  <b>{t("traffic capture")}</b>
+                  {after}
+                </>
+              );
+            })()}{" "}
+            {t('Enable traffic capture under "System settings" first before binding it to agents and enabling it.')}
           </div>
         )}
         {/* binding + switch */}
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <div className="grid gap-1.5">
-            <Label className="text-muted-foreground text-xs">{ui("screen.d2a8ed3e865d05")}</Label>
+            <Label className="text-muted-foreground text-xs">{t("Bind agents (controls which agents get this tool)")}</Label>
             <div className="flex flex-wrap gap-3">
               {agents.map((ag) => (
                 <label key={ag.key} className="flex items-center gap-2 text-sm">
@@ -208,22 +231,20 @@ function ToolEditor({
                   <span className="text-muted-foreground font-mono text-xs">{ag.key}</span>
                 </label>
               ))}
-              {agents.length === 0 && (
-                <span className="text-muted-foreground text-xs">{ui("screen.6d026ee6e4dfc7")}</span>
-              )}
+              {agents.length === 0 && <span className="text-muted-foreground text-xs">{t("(no agents)")}</span>}
             </div>
           </div>
           <div className="flex items-center gap-2">
             <Switch checked={enabled} onCheckedChange={setEnabled} id={`en-${tool.key}`} />
             <Label htmlFor={`en-${tool.key}`} className="text-sm">
-              {ui("screen.f4f0ead1116b5b")}
+              {t("Enable")}
             </Label>
           </div>
         </div>
 
         {/* description */}
         <div className="grid gap-1.5">
-          <Label className="text-muted-foreground text-xs">{ui("screen.9b967dfa2d272b")}</Label>
+          <Label className="text-muted-foreground text-xs">{t("Tool description (sent to the model)")}</Label>
           <Textarea
             className="font-mono text-xs"
             rows={6}
@@ -234,13 +255,16 @@ function ToolEditor({
 
         {/* params */}
         <div className="grid gap-2">
-          <Label className="text-muted-foreground text-xs">{ui("screen.83e6de7c56800a")}</Label>
-          {rows.length === 0 && <span className="text-muted-foreground text-xs">{ui("screen.c336c3a5f5baa0")}</span>}
+          <Label className="text-muted-foreground text-xs">
+            {t("Parameters (name / type / required are read-only; description and default are editable)")}
+          </Label>
+          {rows.length === 0 && <span className="text-muted-foreground text-xs">{t("(no parameters)")}</span>}
           {rows.map((r, i) => (
             <div
               key={(r.parentKey ?? "") + "." + r.name}
-              className={
-                r.parentKey ? "border-l-2 border-muted ml-3 pl-3 grid gap-2 py-2" : "grid gap-2 rounded-md border p-3"
+              className={r.parentKey
+                ? "border-l-2 border-muted ml-3 pl-3 grid gap-2 py-2"
+                : "grid gap-2 rounded-md border p-3"
               }
             >
               <div className="flex flex-wrap items-center gap-2">
@@ -251,16 +275,16 @@ function ToolEditor({
                 </Badge>
                 {r.required && (
                   <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                    {ui("screen.11da9dc4428537")}
+                    {t("Required")}
                   </Badge>
                 )}
                 {r.parentKey && (
-                  <span className="text-muted-foreground text-[10px]">{ui("screen.8f94ddf5a7c692")}</span>
+                  <span className="text-muted-foreground text-[10px]">{t("items sub-field")}</span>
                 )}
               </div>
               <div className="grid gap-2">
                 <div className="grid gap-1">
-                  <Label className="text-muted-foreground text-[11px]">{ui("screen.dc2ba467fc7ac9")}</Label>
+                  <Label className="text-muted-foreground text-[11px]">{t("Description")}</Label>
                   <Input
                     className="text-xs"
                     value={r.description}
@@ -268,10 +292,10 @@ function ToolEditor({
                   />
                 </div>
                 <div className="grid gap-1">
-                  <Label className="text-muted-foreground text-[11px]">{ui("screen.306da767a461a5")}</Label>
+                  <Label className="text-muted-foreground text-[11px]">{t("Default")}</Label>
                   <Input
                     className="text-xs"
-                    placeholder={r.scalar ? ui("screen.74e8b9ae30845f") : ui("screen.1726133b7212ca")}
+                    placeholder={r.scalar ? t("(empty = no default)") : t("scalars only")}
                     disabled={!r.scalar}
                     value={r.defaultStr}
                     onChange={(e) => setRow(i, { defaultStr: e.target.value })}
@@ -286,10 +310,10 @@ function ToolEditor({
       <Separator className="mt-4" />
       <div className="flex flex-wrap gap-2 p-4">
         <Button size="sm" onClick={save} disabled={saving}>
-          <SaveIcon /> {ui("screen.a3030bf8f16dc6")}
+          <SaveIcon /> {t("Save")}
         </Button>
         <Button size="sm" variant="outline" onClick={reset}>
-          <RotateCcwIcon /> {ui("screen.ba2e93e73037c7")}
+          <RotateCcwIcon /> {t("Restore defaults")}
         </Button>
       </div>
     </div>
@@ -298,8 +322,6 @@ function ToolEditor({
 
 // ToolGridCard is one clickable tile in the catalog grid.
 function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
-  const { ui } = useUITranslation();
-
   return (
     <button
       type="button"
@@ -310,39 +332,37 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
         <span className="font-mono text-sm font-medium">{tool.key}</span>
         {tool.system ? (
           <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-            {ui("screen.5b50d7c4b5950d")}
+            {t("System")}
           </Badge>
         ) : (
           <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-            {ui("screen.31f80283afcce3")}
-            {tool.kind}
+            {t("Custom · {kind}", { kind: tool.kind ?? "" })}
           </Badge>
         )}
         {tool.deferred && (
           <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-            deferred
+            {t("deferred")}
           </Badge>
         )}
         {!tool.enabled && (
           <Badge variant="outline" className="text-destructive px-1.5 py-0 text-[10px]">
-            {ui("screen.a8c3698b5b8c48")}
+            {t("Disabled")}
           </Badge>
         )}
         <Badge
           variant="secondary"
           className="ml-auto px-1.5 py-0 text-[10px] tabular-nums"
-          title={ui("screen.f6304be61c53f3", { v0: tool.calls ?? 0 })}
+          title={t("{count} calls in total", { count: tool.calls ?? 0 })}
         >
-          {ui("screen.653b123c956d3b")}
-          {tool.calls ?? 0}
+          {t("{count} calls", { count: tool.calls ?? 0 })}
         </Badge>
       </div>
       <p className="text-muted-foreground line-clamp-1 h-4 text-xs">
-        {tool.description || ui("screen.0042f188770453")}
+        {tool.description || t("(no description)")}
       </p>
       <div className="mt-auto flex flex-wrap gap-1 pt-1">
         {tool.agents.length === 0 && (
-          <span className="text-muted-foreground text-[10px]">{ui("screen.7d97c77ac3183d")}</span>
+          <span className="text-muted-foreground text-[10px]">{t("(no agents bound)")}</span>
         )}
         {tool.agents.map((a) => (
           <Badge key={a} variant="outline" className="px-1.5 py-0 text-[10px]">
@@ -355,8 +375,6 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
 }
 
 export default function ToolsPage() {
-  const { ui } = useUITranslation();
-
   const [tools, setTools] = React.useState<Tool[]>([]);
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [captureOn, setCaptureOn] = React.useState(false);
@@ -364,38 +382,26 @@ export default function ToolsPage() {
   const [customEdit, setCustomEdit] = React.useState<Tool | "new" | null>(null);
 
   const reload = React.useCallback(() => {
-    api
-      .tools()
-      .then(setTools)
-      .catch(() => setTools([]));
+    api.tools().then(setTools).catch(() => setTools([]));
   }, []);
   React.useEffect(() => {
     reload();
-    api
-      .agents()
-      .then(setAgents)
-      .catch(() => {});
-    api
-      .settings()
-      .then((s) => setCaptureOn(!!s.traffic_capture))
-      .catch(() => {});
+    api.agents().then(setAgents).catch(() => {});
+    api.settings().then((s) => setCaptureOn(!!s.traffic_capture)).catch(() => {});
   }, [reload]);
 
   const [query, setQuery] = React.useState("");
 
   const selected = tools.find((t) => t.key === selectedKey) ?? null;
-  const matchTool = React.useCallback(
-    (t: Tool) => {
-      const q = query.trim().toLowerCase();
-      if (!q) return true;
-      return (
-        t.key.toLowerCase().includes(q) ||
-        t.description.toLowerCase().includes(q) ||
-        t.agents.some((a) => a.toLowerCase().includes(q))
-      );
-    },
-    [query],
-  );
+  const matchTool = React.useCallback((t: Tool) => {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      t.key.toLowerCase().includes(q) ||
+      t.description.toLowerCase().includes(q) ||
+      t.agents.some((a) => a.toLowerCase().includes(q))
+    );
+  }, [query]);
   const systemTools = tools.filter((t) => t.system && matchTool(t));
   const customTools = tools.filter((t) => !t.system && matchTool(t));
   const allSystemCount = tools.filter((t) => t.system).length;
@@ -407,14 +413,14 @@ export default function ToolsPage() {
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">{ui("screen.5ca6730d441522")}</h1>
-          <p className="text-muted-foreground text-sm">{ui("screen.070c5bf8a7a0cb")}</p>
+          <h1 className="text-xl font-semibold tracking-tight">{t("Tools")}</h1>
+          <p className="text-muted-foreground text-sm">{t("Descriptions/bindings for system tools, plus custom tools (command/script/http)")}</p>
         </div>
         <div className="relative w-64">
           <SearchIcon className="text-muted-foreground absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2" />
           <Input
             className="h-8 pl-8 text-sm"
-            placeholder={ui("screen.2b7665ed985e0a")}
+            placeholder={t("Search tool name, description, agent…")}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -423,24 +429,29 @@ export default function ToolsPage() {
 
       <Tabs defaultValue="system">
         <TabsList>
-          <TabsTrigger value="system">{ui("screen.6ea702ad9c2b49")}</TabsTrigger>
-          <TabsTrigger value="custom">{ui("screen.1e976a626f6f83")}</TabsTrigger>
+          <TabsTrigger value="system">{t("System tools")}</TabsTrigger>
+          <TabsTrigger value="custom">{t("Custom tools")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="system">
           <Card>
             <CardHeader>
-              <CardTitle>{ui("screen.6ea702ad9c2b49")}</CardTitle>
+              <CardTitle>{t("System tools")}</CardTitle>
               <CardDescription>
                 {query.trim()
-                  ? ui("screen.4d12f613be8bf8", { v0: systemTools.length, v1: allSystemCount })
-                  : ui("screen.f2d63a71fa4dfb", { v0: allSystemCount })}
+                  ? t(
+                      "{count} / {total} matching; click a card to edit the description, parameter defaults and agent bindings",
+                      { count: systemTools.length, total: allSystemCount },
+                    )
+                  : t("{total} total; click a card to edit the description, parameter defaults and agent bindings", {
+                      total: allSystemCount,
+                    })}
               </CardDescription>
             </CardHeader>
             <CardContent>
               {systemTools.length === 0 ? (
                 <p className="text-muted-foreground py-6 text-center text-sm">
-                  {query.trim() ? ui("screen.c31006ada9d69d") : ui("screen.20e14c773f53f6")}
+                  {query.trim() ? t("No matching system tools") : t("(no system tools yet, waiting for the backend seed)")}
                 </p>
               ) : (
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -458,22 +469,28 @@ export default function ToolsPage() {
             <CardHeader>
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <CardTitle>{ui("screen.1e976a626f6f83")}</CardTitle>
+                  <CardTitle>{t("Custom tools")}</CardTitle>
                   <CardDescription>
                     {query.trim()
-                      ? ui("screen.c596c5a80767be", { v0: customTools.length, v1: allCustomCount })
-                      : ui("screen.431df6fd85c9b3", { v0: allCustomCount })}
+                      ? t("shell/command/script/http, {count} / {total} matching; click a card to edit", {
+                          count: customTools.length,
+                          total: allCustomCount,
+                        })
+                      : t(
+                          "shell (bash declaration) / command (command template) / script (Python) / http (API), {total} total; click a card to edit",
+                          { total: allCustomCount },
+                        )}
                   </CardDescription>
                 </div>
                 <Button size="sm" onClick={() => setCustomEdit("new")}>
-                  <PlusIcon /> {ui("screen.87b2833f370844")}
+                  <PlusIcon /> {t("Create custom tool")}
                 </Button>
               </div>
             </CardHeader>
             <CardContent>
               {customTools.length === 0 ? (
                 <p className="text-muted-foreground py-6 text-center text-sm">
-                  {query.trim() ? ui("screen.918b9515dae7aa") : ui("screen.b2ff462a0cff72")}
+                  {query.trim() ? t("No matching custom tools") : t("(no custom tools yet; click 'Create custom tool' in the top right)")}
                 </p>
               ) : (
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -488,12 +505,15 @@ export default function ToolsPage() {
       </Tabs>
 
       <Sheet open={!!selected} onOpenChange={(o) => !o && setSelectedKey(null)}>
-        <SheetContent side="right" className="gap-0 p-0 data-[side=right]:w-[30vw] data-[side=right]:sm:max-w-[30vw]">
+        <SheetContent
+          side="right"
+          className="gap-0 p-0 data-[side=right]:w-[30vw] data-[side=right]:sm:max-w-[30vw]"
+        >
           {selected && (
             <>
               <SheetHeader className="px-4">
                 <SheetTitle className="font-mono">{selected.key}</SheetTitle>
-                <SheetDescription>{ui("screen.e8bbb2829a4b94")}</SheetDescription>
+                <SheetDescription>{t("Edit the description, parameter defaults and agent bindings")}</SheetDescription>
               </SheetHeader>
               <ToolEditor
                 key={selected.key}
@@ -521,7 +541,7 @@ export default function ToolsPage() {
   );
 }
 
-// ---- 自定义工具编辑器 ----
+// ---- custom tool editor ----
 
 type ExecState = {
   command: string;
@@ -546,23 +566,13 @@ function CustomToolDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const { ui } = useUITranslation();
-
   const isNew = edit === "new";
   const tool = edit && edit !== "new" ? edit : null;
   const [key, setKey] = React.useState("");
   const [description, setDescription] = React.useState("");
   const [kind, setKind] = React.useState<"shell" | "command" | "script" | "http">("shell");
   const [ex, setEx] = React.useState<ExecState>({
-    command: "",
-    code: "",
-    method: "GET",
-    url: "",
-    headers: "",
-    body: "",
-    timeout_ms: "",
-    proxy: "",
-    use_recording_proxy: false,
+    command: "", code: "", method: "GET", url: "", headers: "", body: "", timeout_ms: "", proxy: "", use_recording_proxy: false,
   });
   const [schemaText, setSchemaText] = React.useState("");
   const [bound, setBound] = React.useState<string[]>([]);
@@ -576,27 +586,11 @@ function CustomToolDialog({
   // (re)load form state when opening.
   React.useEffect(() => {
     if (!edit) return;
-    setParamsText("");
-    setTestResult(null);
+    setParamsText(""); setTestResult(null);
     if (edit === "new") {
-      setKey("");
-      setDescription("");
-      setKind("shell");
-      setEx({
-        command: "",
-        code: "",
-        method: "GET",
-        url: "",
-        headers: "",
-        body: "",
-        timeout_ms: "",
-        proxy: "",
-        use_recording_proxy: false,
-      });
-      setSchemaText("");
-      setBound([]);
-      setDeferred(false);
-      setEnabled(true);
+      setKey(""); setDescription(""); setKind("shell");
+      setEx({ command: "", code: "", method: "GET", url: "", headers: "", body: "", timeout_ms: "", proxy: "", use_recording_proxy: false });
+      setSchemaText(""); setBound([]); setDeferred(false); setEnabled(true);
       return;
     }
     const t = edit;
@@ -630,69 +624,39 @@ function CustomToolDialog({
     if (kind === "script") return { code: ex.code, timeout_ms: t };
     let headers: Record<string, string> = {};
     if (ex.headers.trim()) {
-      try {
-        headers = JSON.parse(ex.headers);
-      } catch {
-        /* validated on save */
-      }
+      try { headers = JSON.parse(ex.headers); } catch { /* validated on save */ }
     }
-    return {
-      method: ex.method,
-      url: ex.url,
-      headers,
-      body: ex.body,
-      timeout_ms: t,
-      proxy: ex.proxy,
-      use_recording_proxy: ex.use_recording_proxy,
-    };
+    return { method: ex.method, url: ex.url, headers, body: ex.body, timeout_ms: t, proxy: ex.proxy, use_recording_proxy: ex.use_recording_proxy };
   }
 
   async function save() {
     if (isNew && !/^[a-z][a-z0-9_]*$/.test(key.trim())) {
-      toast.error(ui("screen.c642001d5315f6"));
+      toast.error(t("key must start with a lowercase letter and contain only lowercase letters/digits/underscores"));
       return;
     }
     let schema: Record<string, unknown> = {};
     if (schemaText.trim()) {
-      try {
-        schema = JSON.parse(schemaText);
-      } catch {
-        toast.error(ui("screen.bab199cfb603cf"));
-        return;
-      }
+      try { schema = JSON.parse(schemaText); } catch { toast.error(t("Invalid parameter JSON Schema")); return; }
     }
     if (kind === "http" && ex.headers.trim()) {
-      try {
-        JSON.parse(ex.headers);
-      } catch {
-        toast.error(ui("screen.fa9c8243f5a643"));
-        return;
-      }
+      try { JSON.parse(ex.headers); } catch { toast.error(t("Invalid headers JSON")); return; }
     }
     if (kind === "http") {
       const props = (schema as { properties?: Record<string, unknown> }).properties;
       if (!props || Object.keys(props).length === 0) {
-        toast.error(ui("screen.0ba562d5560cea"));
+        toast.error(t("http tools must provide a parameter JSON Schema (with properties; cannot be empty)"));
         return;
       }
     }
     setSaving(true);
-    const payload = {
-      description,
-      schema: kind === "shell" ? {} : schema,
-      agents: bound,
-      enabled,
-      kind,
-      exec: buildExec(),
-      deferred: kind === "shell" ? false : deferred,
-    };
+    const payload = { description, schema: kind === "shell" ? {} : schema, agents: bound, enabled, kind, exec: buildExec(), deferred: kind === "shell" ? false : deferred };
     try {
       if (isNew) await api.createCustomTool({ key: key.trim(), ...payload });
       else await api.updateCustomTool(tool!.key, payload);
-      toast.success(isNew ? ui("screen.53264be8bfee72") : ui("screen.1bd91a7d0c53c9"));
+      toast.success(isNew ? t("Custom tool created") : t("Saved"));
       onSaved();
     } catch (e) {
-      toast.error(ui("screen.6ade7baf8737c0") + (e as Error).message);
+      toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
       setSaving(false);
     }
@@ -701,10 +665,10 @@ function CustomToolDialog({
     if (!tool) return;
     try {
       await api.deleteCustomTool(tool.key);
-      toast.success(ui("screen.077a6d37719a0e"));
+      toast.success(t("Deleted"));
       onSaved();
     } catch (e) {
-      toast.error(ui("screen.0580fcee37e020") + (e as Error).message);
+      toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
     }
   }
   // runTest dry-runs the CURRENT form (unsaved) with the sample params, so a
@@ -712,25 +676,16 @@ function CustomToolDialog({
   async function runTest() {
     let params: Record<string, unknown> = {};
     if (paramsText.trim()) {
-      try {
-        params = JSON.parse(paramsText);
-      } catch {
-        toast.error(ui("screen.5194c511368a9c"));
-        return;
-      }
+      try { params = JSON.parse(paramsText); } catch { toast.error(t("Invalid test parameter JSON")); return; }
     }
     if (kind === "http" && ex.headers.trim()) {
-      try {
-        JSON.parse(ex.headers);
-      } catch {
-        toast.error(ui("screen.fa9c8243f5a643"));
-        return;
-      }
+      try { JSON.parse(ex.headers); } catch { toast.error(t("Invalid headers JSON")); return; }
     }
     setTesting(true);
     setTestResult(null);
     try {
-      const r = await api.testCustomTool({ kind, exec: buildExec(), params });
+      // key: a saved tool's stored secrets replace the masked placeholders.
+      const r = await api.testCustomTool({ key: tool?.key, kind, exec: buildExec(), params });
       setTestResult(r);
     } catch (e) {
       setTestResult({ output: (e as Error).message, is_error: true });
@@ -746,139 +701,85 @@ function CustomToolDialog({
         className="flex flex-col gap-0 p-0 data-[side=right]:w-[45vw] data-[side=right]:sm:max-w-[45vw] data-[side=right]:min-w-[480px]"
       >
         <SheetHeader className="px-4">
-          <SheetTitle>
-            {isNew ? ui("screen.87b2833f370844") : ui("screen.f6de91250ef4ad", { v0: tool?.key })}
-          </SheetTitle>
-          <SheetDescription>{ui("screen.5aedc801135f87")}</SheetDescription>
+          <SheetTitle>{isNew ? t("Create custom tool") : t("Edit {key}", { key: tool?.key ?? "" })}</SheetTitle>
+          <SheetDescription>
+            {t(
+              "shell = a bash environment declaration (name + description only, telling the model bash is available); command/script/http need an execution spec.",
+            )}
+          </SheetDescription>
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
           <div className="grid gap-1.5">
-            <Label className="text-xs">Key</Label>
-            <Input
-              className="font-mono"
-              placeholder={ui("screen.9210ea3a655465")}
-              value={key}
-              disabled={!isNew}
-              onChange={(e) => setKey(e.target.value)}
-            />
+            <Label className="text-xs">{t("Key")}</Label>
+            <Input className="font-mono" placeholder={t("e.g. nmap_scan")} value={key} disabled={!isNew}
+              onChange={(e) => setKey(e.target.value)} />
           </div>
           <div className="grid gap-1.5">
-            <Label className="text-xs">{ui("screen.e4c430635064b5")}</Label>
+            <Label className="text-xs">{t("Description (sent to the model)")}</Label>
             <Textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
           </div>
 
           <div className="grid gap-1.5">
-            <Label className="text-xs">{ui("screen.ba40014ff496f6")}</Label>
+            <Label className="text-xs">{t("Type")}</Label>
             <Select value={kind} onValueChange={(v) => setKind(v as "shell" | "command" | "script" | "http")}>
-              <SelectTrigger className="w-56">
-                <SelectValue />
-              </SelectTrigger>
+              <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="shell">{ui("screen.896f9cb6fa7276")}</SelectItem>
-                <SelectItem value="command">{ui("screen.fcf63aa2fdd22f")}</SelectItem>
-                <SelectItem value="script">{ui("screen.2a97d1c87f3d4d")}</SelectItem>
-                <SelectItem value="http">{ui("screen.f49ce697cf29c0")}</SelectItem>
+                <SelectItem value="shell">{t("shell (bash environment declaration)")}</SelectItem>
+                <SelectItem value="command">{t("command (shell command template)")}</SelectItem>
+                <SelectItem value="script">{t("script (Python script)")}</SelectItem>
+                <SelectItem value="http">{t("http (API request)")}</SelectItem>
               </SelectContent>
             </Select>
-            {kind === "shell" && <p className="text-muted-foreground text-xs">{ui("screen.d8bcec9f7cd637")}</p>}
+            {kind === "shell" && (
+              <p className="text-muted-foreground text-xs">{t("Suited to well-known tools like nmap, sqlmap, ffuf — the model already knows their usage; you only need to declare \"can be invoked in bash\". The name + description are appended to the Bash tool's description.")}</p>
+            )}
           </div>
 
           {kind === "command" && (
             <div className="grid gap-1.5">
-              <Label className="text-xs">
-                {ui("screen.2d5caa25ce29ff")}
-                {"{param}"}
-                {ui("screen.e9f1af3c3757f9")}
-                {"{ports}"} {"{target}"}
-                {ui("punctuation.f2e44c6c95")}
-              </Label>
-              <Textarea
-                className="font-mono text-xs"
-                rows={2}
-                value={ex.command}
-                onChange={(e) => setEx({ ...ex, command: e.target.value })}
-              />
+              <Label className="text-xs">{t("Command template (placeholder {param}, e.g. nmap -p {ports} {target})")}</Label>
+              <Textarea className="font-mono text-xs" rows={2} value={ex.command}
+                onChange={(e) => setEx({ ...ex, command: e.target.value })} />
             </div>
           )}
           {kind === "script" && (
             <div className="grid gap-1.5">
-              <Label className="text-xs">{ui("screen.95acd4249dea97")}</Label>
-              <Textarea
-                className="font-mono text-xs"
-                rows={10}
-                value={ex.code}
-                placeholder={"import json,sys\nargs=json.load(sys.stdin)\nprint(...)"}
-                onChange={(e) => setEx({ ...ex, code: e.target.value })}
-              />
+              <Label className="text-xs">{t("Python body (params arrive via stdin JSON / os.environ[\"TOOL_X\"])")}</Label>
+              <Textarea className="font-mono text-xs" rows={10} value={ex.code}
+                placeholder={'import json,sys\nargs=json.load(sys.stdin)\nprint(...)'}
+                onChange={(e) => setEx({ ...ex, code: e.target.value })} />
             </div>
           )}
           {kind === "http" && (
             <div className="grid gap-2">
               <div className="flex gap-2">
                 <div className="grid gap-1.5">
-                  <Label className="text-xs">Method</Label>
-                  <Input
-                    className="w-24"
-                    value={ex.method}
-                    onChange={(e) => setEx({ ...ex, method: e.target.value })}
-                  />
+                  <Label className="text-xs">{t("Method")}</Label>
+                  <Input className="w-24" value={ex.method} onChange={(e) => setEx({ ...ex, method: e.target.value })} />
                 </div>
                 <div className="grid flex-1 gap-1.5">
-                  <Label className="text-xs">
-                    {ui("screen.69101230b8f993")}
-                    {"{param}"}
-                    {ui("punctuation.f2e44c6c95")}
-                  </Label>
-                  <Input
-                    className="font-mono text-xs"
-                    value={ex.url}
-                    onChange={(e) => setEx({ ...ex, url: e.target.value })}
-                  />
+                  <Label className="text-xs">{t("URL (may contain {param})")}</Label>
+                  <Input className="font-mono text-xs" value={ex.url} onChange={(e) => setEx({ ...ex, url: e.target.value })} />
                 </div>
               </div>
               <div className="grid gap-1.5">
-                <Label className="text-xs">
-                  {ui("screen.279bfc6d553f63")}
-                  {"{param}"}
-                  {ui("punctuation.f2e44c6c95")}
-                </Label>
-                <Textarea
-                  className="font-mono text-xs"
-                  rows={2}
-                  value={ex.headers}
-                  placeholder={'{"Authorization": "Bearer {token}"}'}
-                  onChange={(e) => setEx({ ...ex, headers: e.target.value })}
-                />
+                <Label className="text-xs">{t("Headers (JSON, may contain {param})")}</Label>
+                <Textarea className="font-mono text-xs" rows={2} value={ex.headers}
+                  placeholder={'{"Authorization": "Bearer {token}"}'} onChange={(e) => setEx({ ...ex, headers: e.target.value })} />
               </div>
               <div className="grid gap-1.5">
-                <Label className="text-xs">
-                  {ui("screen.7a58b49ecafbfe")}
-                  {"{param}"}
-                  {ui("punctuation.f2e44c6c95")}
-                </Label>
-                <Textarea
-                  className="font-mono text-xs"
-                  rows={2}
-                  value={ex.body}
-                  onChange={(e) => setEx({ ...ex, body: e.target.value })}
-                />
+                <Label className="text-xs">{t("Body (may contain {param})")}</Label>
+                <Textarea className="font-mono text-xs" rows={2} value={ex.body} onChange={(e) => setEx({ ...ex, body: e.target.value })} />
               </div>
               <div className="flex items-center gap-4">
                 <div className="grid gap-1.5">
-                  <Label className="text-xs">{ui("screen.17b9f1c37b2057")}</Label>
-                  <Input
-                    className="font-mono text-xs w-56"
-                    value={ex.proxy}
-                    onChange={(e) => setEx({ ...ex, proxy: e.target.value })}
-                  />
+                  <Label className="text-xs">{t("Proxy URL (empty = direct)")}</Label>
+                  <Input className="font-mono text-xs w-56" value={ex.proxy} onChange={(e) => setEx({ ...ex, proxy: e.target.value })} />
                 </div>
                 <label className="mt-4 flex items-center gap-2 text-sm">
-                  <Checkbox
-                    checked={ex.use_recording_proxy}
-                    onCheckedChange={(v) => setEx({ ...ex, use_recording_proxy: !!v })}
-                  />
-                  {ui("screen.5bd60af132eb13")}
+                  <Checkbox checked={ex.use_recording_proxy} onCheckedChange={(v) => setEx({ ...ex, use_recording_proxy: !!v })} />
+                  {t("Use recording proxy")}
                 </label>
               </div>
             </div>
@@ -887,13 +788,8 @@ function CustomToolDialog({
           {kind !== "shell" && (
             <div className="flex items-center gap-3">
               <div className="grid gap-1.5">
-                <Label className="text-xs">{ui("screen.38b6f0e56d09c4")}</Label>
-                <Input
-                  type="number"
-                  className="w-32"
-                  value={ex.timeout_ms}
-                  onChange={(e) => setEx({ ...ex, timeout_ms: e.target.value })}
-                />
+                <Label className="text-xs">{t("Timeout (ms, empty = default)")}</Label>
+                <Input type="number" className="w-32" value={ex.timeout_ms} onChange={(e) => setEx({ ...ex, timeout_ms: e.target.value })} />
               </div>
             </div>
           )}
@@ -901,27 +797,23 @@ function CustomToolDialog({
           {kind !== "shell" && (
             <div className="grid gap-1.5">
               <Label className="text-xs">
-                {ui("screen.7ff6a7d0a41f31")}
-                {kind === "http" ? ui("screen.46f4df9c0d2da9") : ui("screen.84780d91a21684")}
+                {kind === "http"
+                  ? t("Parameter JSON Schema (required for http tools, must include properties)")
+                  : t("Parameter JSON Schema (empty = a thin {args} shell is generated automatically)")}
               </Label>
-              <Textarea
-                className="font-mono text-xs"
-                rows={4}
-                value={schemaText}
+              <Textarea className="font-mono text-xs" rows={4} value={schemaText}
                 placeholder={'{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}'}
-                onChange={(e) => setSchemaText(e.target.value)}
-              />
+                onChange={(e) => setSchemaText(e.target.value)} />
             </div>
           )}
 
           <div className="grid gap-1.5">
-            <Label className="text-muted-foreground text-xs">{ui("screen.7bb739274d9847")}</Label>
+            <Label className="text-muted-foreground text-xs">{t("Bind agents")}</Label>
             <div className="flex flex-wrap gap-3">
               {agents.map((a) => (
                 <label key={a.key} className="flex items-center gap-2 text-sm">
                   <Checkbox checked={bound.includes(a.key)} onCheckedChange={() => toggleAgent(a.key)} />
-                  {a.name}
-                  <span className="text-muted-foreground font-mono text-xs">{a.key}</span>
+                  {a.name}<span className="text-muted-foreground font-mono text-xs">{a.key}</span>
                 </label>
               ))}
             </div>
@@ -929,28 +821,24 @@ function CustomToolDialog({
 
           <div className="flex items-center gap-6">
             <label className="flex items-center gap-2 text-sm">
-              <Switch checked={enabled} onCheckedChange={setEnabled} /> {ui("screen.f4f0ead1116b5b")}
+              <Switch checked={enabled} onCheckedChange={setEnabled} /> {t("Enable")}
             </label>
             {kind !== "shell" && (
               <label className="flex items-center gap-2 text-sm">
-                <Switch checked={deferred} onCheckedChange={setDeferred} /> {ui("screen.73edf6b3638e54")}
+                <Switch checked={deferred} onCheckedChange={setDeferred} /> {t("deferred (enable only for many rarely-used tools)")}
               </label>
             )}
           </div>
 
           {kind !== "shell" && (
             <div className="grid gap-1.5 rounded-md border p-3">
-              <Label className="text-xs font-medium">{ui("screen.609b160d85ef96")}</Label>
-              <Textarea
-                className="font-mono text-xs"
-                rows={2}
-                value={paramsText}
-                placeholder={ui("screen.4e9ddebfaff607")}
-                onChange={(e) => setParamsText(e.target.value)}
-              />
+              <Label className="text-xs font-medium">{t("Test run (uses the current form, nothing is saved)")}</Label>
+              <Textarea className="font-mono text-xs" rows={2} value={paramsText}
+                placeholder={t('Sample params JSON, e.g. {"target":"example.com"}')}
+                onChange={(e) => setParamsText(e.target.value)} />
               <div>
                 <Button size="sm" variant="outline" onClick={runTest} disabled={testing}>
-                  <PlayIcon /> {testing ? ui("screen.14d9f2d830adb2") : ui("screen.1bb75d7ff2bf84")}
+                  <PlayIcon /> {testing ? t("Running…") : t("Test run")}
                 </Button>
               </div>
               {testResult && (
@@ -960,7 +848,7 @@ function CustomToolDialog({
                     (testResult.is_error ? "text-destructive" : "")
                   }
                 >
-                  {testResult.output || ui("screen.8ae64c2c8ce582")}
+                  {testResult.output || t("(no output)")}
                 </pre>
               )}
             </div>
@@ -970,11 +858,11 @@ function CustomToolDialog({
         <Separator />
         <div className="flex items-center gap-2 p-4">
           <Button size="sm" onClick={save} disabled={saving}>
-            <SaveIcon /> {isNew ? ui("screen.cde2cd071d25bb") : ui("screen.a3030bf8f16dc6")}
+            <SaveIcon /> {isNew ? t("Create") : t("Save")}
           </Button>
           {!isNew && (
             <Button size="sm" variant="outline" className="text-destructive" onClick={del}>
-              <Trash2Icon /> {ui("screen.2f9daa828907b9")}
+              <Trash2Icon /> {t("Delete")}
             </Button>
           )}
         </div>

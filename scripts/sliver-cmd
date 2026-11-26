@@ -1,0 +1,13 @@
+#!/bin/sh
+# Run one or more Sliver client commands from an rc script.
+# The custom tool passes the whole command line as a single quoted argument.
+set -eu
+cfg="${SLIVER_CONFIG:-/app/data/sliver/artex.cfg}"
+if [ ! -r "$cfg" ]; then
+    echo "sliver-cmd: config not found: $cfg (create it with: sliver-cmd setup)" >&2
+    exit 2
+fi
+rc="$(mktemp)"
+trap 'rm -f "$rc"' EXIT
+printf '%s\n' "$*" > "$rc"
+exec sliver-client --config "$cfg" --rc "$rc"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Run a Metasploit console command and exit. -x takes one command string.
+set -eu
+exec msfconsole -q -x "$*; exit"

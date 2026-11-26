@@ -15,8 +15,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { notificationError } from "@/i18n/notify-runtime";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
+import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { NotificationChannel, NotificationFilter, NotificationMeta } from "@/lib/types";
 
@@ -34,12 +33,23 @@ import { ConfigField, FilterSummary } from "./_components/channel-form";
 import { DeliveryList } from "./_components/delivery-list";
 import { formatBacklog, StatTile } from "./_components/stat-tile";
 
-// 本页只负责编排：加载数据、维护表单状态、调用接口。
-// 字段定义与解析在 _components/channel-fields.ts，控件与过滤摘要在
-// _components/channel-form.tsx，投递记录在 _components/delivery-list.tsx——
-// 拆开是因为它们各自能被单独读懂，而挤在一个文件里时这个页面接近 1100 行。
+// Upper bounds of the two message render limits. They mirror the backend, which answers 400 outside [0, max].
+const SUMMARY_LIMIT_MAX = 4000;
+const ASSETS_LIMIT_MAX = 50;
+
+// limitInvalid reports whether a limit input holds anything other than a whole number in [0, max].
+// Empty is valid: it is not submitted, so the stored value stays as it is.
+function limitInvalid(raw: string, max: number): boolean {
+  if (raw.trim() === "") return false;
+  const n = Number(raw);
+  return !Number.isInteger(n) || n < 0 || n > max;
+}
+
+// This page only orchestrates: loading data, holding form state, calling the API.
+// Field definitions and parsing live in _components/channel-fields.ts, controls and the filter summary in
+// _components/channel-form.tsx, and the delivery log in _components/delivery-list.tsx —
+// they are split out because each stays readable on its own, whereas crammed into one file this page neared 1100 lines.
 export default function NotifyPage() {
-  const { t: translate, liveT } = useLiveTranslation();
   const [meta, setMeta] = React.useState<NotificationMeta | null>(null);
   const [channels, setChannels] = React.useState<NotificationChannel[]>([]);
   const [tab, setTab] = React.useState<"channels" | "deliveries">("channels");
@@ -53,6 +63,8 @@ export default function NotifyPage() {
   const [globalSaving, setGlobalSaving] = React.useState(false);
   const [baseURL, setBaseURL] = React.useState("");
   const [digestMin, setDigestMin] = React.useState("");
+  const [summaryMax, setSummaryMax] = React.useState("");
+  const [assetsMax, setAssetsMax] = React.useState("");
 
   const load = React.useCallback(() => {
     api
@@ -62,14 +74,22 @@ export default function NotifyPage() {
         setBaseURL(m.public_base_url);
         setDigestMin(m.digest_interval_min);
       })
-      .catch((e) => toast.error(liveT("notify.loadMetaFailed", { message: notificationError(e, liveT) })));
-    // 渠道列表加载失败要报出来：静默失败会显示成「一个渠道都没有」，
-    // 用户会以为配置丢了，比直接报错更让人慌。
+      .catch((e) => toast.error(t("Failed to load notification settings: {error}", { error: (e as Error).message })));
+    // The two render limits are not part of /notify/meta; they are only exposed through /api/settings.
+    api
+      .settings()
+      .then((s) => {
+        setSummaryMax(String(s.notify_summary_max_runes ?? ""));
+        setAssetsMax(String(s.notify_assets_max_shown ?? ""));
+      })
+      .catch((e) => toast.error(t("Failed to load message limits: {error}", { error: (e as Error).message })));
+    // Channel-list load failures must be reported: failing silently would render as "no channels at all",
+    // and users would think their config was lost — scarier than a straight-up error.
     api
       .notifyChannels()
       .then(setChannels)
-      .catch((e) => toast.error(liveT("notify.loadChannelsFailed", { message: notificationError(e, liveT) })));
-  }, [liveT]);
+      .catch((e) => toast.error(t("Failed to load channels: {error}", { error: (e as Error).message })));
+  }, []);
   React.useEffect(() => {
     load();
   }, [load]);
@@ -89,7 +109,7 @@ export default function NotifyPage() {
 
   function openEdit(ch: NotificationChannel) {
     setEditing(ch);
-    // filter 在后端是 Go 结构体，永远序列化成对象（不会是 null），所以不需要兜底。
+    // filter is a Go struct on the backend and always serializes as an object (never null), so no fallback is needed.
     const f = ch.filter;
     setForm({
       name: ch.name,
@@ -97,8 +117,8 @@ export default function NotifyPage() {
       mode: ch.mode,
       enabled: ch.enabled,
       ratePerMin: String(ch.rate_per_min),
-      // 后端回显的 config 里凭据是掩码值；原样放进表单，提交时原样送回，
-      // 后端据此保留库中原值。
+      // Credentials in the backend-echoed config are masked values; put them into the form as-is and send them back as-is on submit,
+      // which tells the backend to keep the stored values.
       config: { ...ch.config },
       minSeverity: f.min_severity ?? "",
       includeText: (f.vulnclass_include ?? []).join("\n"),
@@ -110,17 +130,17 @@ export default function NotifyPage() {
     setOpen(true);
   }
 
-  // buildConfig 把表单状态转成渠道 config。
+  // buildConfig turns form state into the channel config.
   //
-  // 唯一的规则，两类值：
-  //   - 掩码值（"__masked__..."）原样送回 → 后端解读为「这个字段没改，保留库中原值」
-  //   - 其余一律按用户输入提交，空串即「清空该字段」
+  // One rule, two kinds of values:
+  //   - masked values ("__masked__...") are sent back verbatim → the backend reads this as "field unchanged, keep the stored value"
+  //   - everything else is submitted as user input, where an empty string means "clear this field"
   //
-  // 之所以不特殊照顾凭据字段（比如「凭据留空就跳过」），是因为那会让用户**无法清除**
-  // 一个设错的密钥——界面上没有任何操作能表达「我要把它删掉」。现在的规则下，
-  // 清空输入框就等于清空该字段，语义唯一且用户可控。
-  // 掩码值不会出现在输入框里（见 ConfigField），所以「框里有字」永远等于
-  // 「用户主动填的」。
+  // Credential fields get no special treatment (no "skip when empty") because that would make it **impossible** to clear
+  // a mis-set key — no action in the UI could express "I want this gone". Under the current rule,
+  // emptying the input equals clearing the field: one unambiguous, user-controlled semantic.
+  // Masked values never appear in inputs (see ConfigField), so "text in the box" always means
+  // "the user typed it".
   function buildConfig(): Record<string, unknown> {
     const defs = CHANNEL_FIELDS[form.kind] ?? [];
     const out: Record<string, unknown> = {};
@@ -145,7 +165,7 @@ export default function NotifyPage() {
       }
       if (d.kind === "list") {
         out[d.key] = String(raw ?? "")
-          .split(/[\s,，]+/)
+          .split(/[\s,]+/)
           .map((s) => s.trim())
           .filter(Boolean);
         continue;
@@ -168,7 +188,7 @@ export default function NotifyPage() {
 
   async function saveForm() {
     if (!form.name.trim()) {
-      toast.error(translate("notify.nameRequired"));
+      toast.error(t("Please fill in a channel name"));
       return;
     }
     setSaving(true);
@@ -184,16 +204,16 @@ export default function NotifyPage() {
       };
       if (editing) {
         await api.notifyUpdateChannel(editing.id, payload);
-        toast.success(translate("notify.saved"));
+        toast.success(t("Saved"));
         setOpen(false);
       } else {
         await api.notifyCreateChannel(payload);
-        toast.success(translate("notify.added"));
+        toast.success(t("Channel added"));
         setOpen(false);
       }
       load();
     } catch (e) {
-      toast.error(translate("notify.saveFailed", { message: notificationError(e, translate) }));
+      toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
       setSaving(false);
     }
@@ -204,10 +224,10 @@ export default function NotifyPage() {
     setTesting(true);
     try {
       const r = await api.notifyTestChannel(editing.id);
-      toast.success(translate("notify.testSent", { latency: r.latency_ms }));
+      toast.success(t("Test message sent ({ms} ms); check the group to confirm", { ms: r.latency_ms }));
     } catch (e) {
-      // 后端把渠道返回的原始错误如实回传，这是排查配置的唯一线索，原样展示。
-      toast.error(translate("notify.testFailed", { message: notificationError(e, translate) }), { duration: 12000 });
+      // The backend relays the raw error returned by the channel verbatim — the only clue for debugging the config — so show it as-is.
+      toast.error(t("Test failed: {error}", { error: (e as Error).message }), { duration: 12000 });
     } finally {
       setTesting(false);
     }
@@ -216,11 +236,11 @@ export default function NotifyPage() {
   async function removeChannel(ch: NotificationChannel) {
     try {
       await api.notifyDeleteChannel(ch.id);
-      toast.success(translate("notify.deletedChannel", { name: ch.name }));
+      toast.success(t("Deleted: {name}", { name: ch.name }));
       setOpen(false);
       load();
     } catch (e) {
-      toast.error(translate("notify.deleteFailed", { message: notificationError(e, translate) }));
+      toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -229,7 +249,7 @@ export default function NotifyPage() {
       await api.notifyUpdateChannel(ch.id, { enabled: !ch.enabled });
       load();
     } catch (e) {
-      toast.error(translate("notify.actionFailed", { message: notificationError(e, translate) }));
+      toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -238,25 +258,37 @@ export default function NotifyPage() {
     try {
       await api.setSettings({ notify_enabled: on });
       setMeta((m) => (m ? { ...m, enabled: on } : m));
-      toast.success(on ? translate("notify.enabled") : translate("notify.paused"));
+      toast.success(on ? t("Push enabled") : t("Push paused"));
     } catch (e) {
-      toast.error(translate("notify.actionFailed", { message: notificationError(e, translate) }));
+      toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
     } finally {
       setGlobalSaving(false);
     }
   }
 
   async function saveGlobal() {
+    // Checked before anything is sent: the backend applies the fields of one PUT in order,
+    // so a 400 on a limit would leave the URL and digest interval already saved.
+    if (limitInvalid(summaryMax, SUMMARY_LIMIT_MAX)) {
+      toast.error(t("Summary length must be a whole number between 0 and {max}", { max: SUMMARY_LIMIT_MAX }));
+      return;
+    }
+    if (limitInvalid(assetsMax, ASSETS_LIMIT_MAX)) {
+      toast.error(t("Assets listed must be a whole number between 0 and {max}", { max: ASSETS_LIMIT_MAX }));
+      return;
+    }
     setGlobalSaving(true);
     try {
       const patch: Record<string, unknown> = { notify_public_base_url: baseURL.trim() };
       const n = Number(digestMin);
       if (Number.isFinite(n) && n > 0) patch.notify_digest_interval_min = n;
+      if (summaryMax.trim() !== "") patch.notify_summary_max_runes = Number(summaryMax);
+      if (assetsMax.trim() !== "") patch.notify_assets_max_shown = Number(assetsMax);
       await api.setSettings(patch);
-      toast.success(translate("notify.saved"));
+      toast.success(t("Saved"));
       load();
     } catch (e) {
-      toast.error(translate("notify.saveFailed", { message: notificationError(e, translate) }));
+      toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
       setGlobalSaving(false);
     }
@@ -270,19 +302,21 @@ export default function NotifyPage() {
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">{translate("notify.title")}</h1>
-          <p className="text-muted-foreground text-sm">{translate("notify.description")}</p>
+          <h1 className="text-xl font-semibold tracking-tight">{t("Notifications")}</h1>
+          <p className="text-muted-foreground text-sm">
+            {t("Push findings to DingTalk / Feishu / WeCom and other channels · each channel has its own delivery timing and filter rules")}
+          </p>
         </div>
         {meta && (
-          // 用 div 而不是 label：Switch 自带 aria-label，外面再套一层 label
-          // 既关联不到任何原生控件，又会让点击文字看起来应该能切换。
+          // A div, not a label: the Switch carries its own aria-label, and wrapping it in a label
+          // would associate it with no native control while making the text look like it should toggle.
           <div className="flex shrink-0 items-center gap-2 text-sm">
-            <span className="text-muted-foreground">{translate("notify.masterSwitch")}</span>
+            <span className="text-muted-foreground">{t("Master switch")}</span>
             <Switch
               checked={meta.enabled}
               disabled={globalSaving}
               onCheckedChange={toggleGlobal}
-              aria-label={translate("notify.masterSwitchLabel")}
+              aria-label={t("Push master switch")}
             />
           </div>
         )}
@@ -290,23 +324,15 @@ export default function NotifyPage() {
 
       {meta && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          <StatTile label={t("Channels")} value={`${meta.stats.channels_on} / ${meta.stats.channels}`} hint={t("On / total")} />
+          <StatTile label={t("Sent today")} value={String(meta.stats.sent_today)} />
+          <StatTile label={t("Pending")} value={String(meta.stats.pending)} />
+          <StatTile label={t("Failed")} value={String(meta.stats.failed)} tone={meta.stats.failed > 0 ? "red" : undefined} />
           <StatTile
-            label={translate("notify.channels")}
-            value={`${meta.stats.channels_on} / ${meta.stats.channels}`}
-            hint={translate("notify.enabledTotal")}
-          />
-          <StatTile label={translate("notify.sentToday")} value={String(meta.stats.sent_today)} />
-          <StatTile label={translate("notify.pending")} value={String(meta.stats.pending)} />
-          <StatTile
-            label={translate("notify.failed")}
-            value={String(meta.stats.failed)}
-            tone={meta.stats.failed > 0 ? "red" : undefined}
-          />
-          <StatTile
-            label={translate("notify.oldestBacklog")}
-            value={formatBacklog(meta.stats.backlog_age_ms, translate)}
-            // 积压年龄比积压条数有用得多：积压 3 条可以是从 3 秒到 3 小时。
-            hint={meta.stats.backlog_age_ms > 5 * 60_000 ? translate("notify.backlogWarning") : undefined}
+            label={t("Oldest backlog")}
+            value={formatBacklog(meta.stats.backlog_age_ms)}
+            // Backlog age is far more useful than backlog count: 3 backlogged items could mean 3 seconds or 3 hours.
+            hint={meta.stats.backlog_age_ms > 5 * 60_000 ? t("Push may be stuck") : undefined}
             tone={meta.stats.backlog_age_ms > 5 * 60_000 ? "red" : undefined}
           />
         </div>
@@ -314,21 +340,21 @@ export default function NotifyPage() {
 
       <Card className="gap-3">
         <CardHeader>
-          <CardTitle className="text-base">{translate("notify.globalSettings")}</CardTitle>
+          <CardTitle className="text-base">{t("Global settings")}</CardTitle>
         </CardHeader>
         <CardContent className="grid gap-4 sm:grid-cols-2">
           <div className="grid gap-2">
-            <Label htmlFor="n-base">{translate("notify.baseUrl")}</Label>
+            <Label htmlFor="n-base">{t("Link-back URL")}</Label>
             <Input
               id="n-base"
               placeholder="https://artex.example.com"
               value={baseURL}
               onChange={(e) => setBaseURL(e.target.value)}
             />
-            <p className="text-muted-foreground text-xs">{translate("notify.baseUrlHelp")}</p>
+            <p className="text-muted-foreground text-xs">{t("The address the \"View details\" button in messages points to. Leave empty to omit the button.")}</p>
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="n-digest">{translate("notify.digestInterval")}</Label>
+            <Label htmlFor="n-digest">{t("Digest interval (minutes)")}</Label>
             <Input
               id="n-digest"
               type="number"
@@ -338,11 +364,45 @@ export default function NotifyPage() {
               value={digestMin}
               onChange={(e) => setDigestMin(e.target.value)}
             />
-            <p className="text-muted-foreground text-xs">{translate("notify.digestIntervalHelp")}</p>
+            <p className="text-muted-foreground text-xs">{t("Only applies to channels in \"digest\" mode.")}</p>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="n-summary-max">{t("Summary length (characters)")}</Label>
+            <Input
+              id="n-summary-max"
+              type="number"
+              min={0}
+              max={SUMMARY_LIMIT_MAX}
+              step={1}
+              placeholder="120"
+              value={summaryMax}
+              onChange={(e) => setSummaryMax(e.target.value)}
+              aria-invalid={limitInvalid(summaryMax, SUMMARY_LIMIT_MAX)}
+            />
+            <p className="text-muted-foreground text-xs">
+              {t("Longest finding summary shown in a message, 0–{max}. 0 = no truncation.", { max: SUMMARY_LIMIT_MAX })}
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="n-assets-max">{t("Assets listed per finding")}</Label>
+            <Input
+              id="n-assets-max"
+              type="number"
+              min={0}
+              max={ASSETS_LIMIT_MAX}
+              step={1}
+              placeholder="3"
+              value={assetsMax}
+              onChange={(e) => setAssetsMax(e.target.value)}
+              aria-invalid={limitInvalid(assetsMax, ASSETS_LIMIT_MAX)}
+            />
+            <p className="text-muted-foreground text-xs">
+              {t("Most asset names listed for a finding, 0–{max}. 0 = no truncation (all assets listed).", { max: ASSETS_LIMIT_MAX })}
+            </p>
           </div>
           <div className="sm:col-span-2">
             <Button onClick={saveGlobal} disabled={globalSaving}>
-              {translate("notify.saveGlobal")}
+              {t("Save global settings")}
             </Button>
           </div>
         </CardContent>
@@ -350,8 +410,8 @@ export default function NotifyPage() {
 
       <Tabs value={tab} onValueChange={(v) => setTab(v as "channels" | "deliveries")} className="flex flex-col gap-4">
         <TabsList>
-          <TabsTrigger value="channels">{translate("notify.channels")}</TabsTrigger>
-          <TabsTrigger value="deliveries">{translate("notify.deliveries")}</TabsTrigger>
+          <TabsTrigger value="channels">{t("Channels")}</TabsTrigger>
+          <TabsTrigger value="deliveries">{t("Delivery log")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="channels">
@@ -362,7 +422,7 @@ export default function NotifyPage() {
               className="text-foreground/70 border-foreground/70 hover:bg-muted/60 hover:shadow-sm flex min-h-[130px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed transition"
             >
               <PlusIcon className="size-6" />
-              <span className="text-sm">{translate("notify.addChannel")}</span>
+              <span className="text-sm">{t("Add channel")}</span>
             </button>
 
             {channels.map((ch) => (
@@ -375,25 +435,25 @@ export default function NotifyPage() {
                   <div className="flex items-center gap-2">
                     <BellIcon className="text-muted-foreground size-4 shrink-0" />
                     <CardTitle className="truncate text-base">{ch.name}</CardTitle>
-                    {/* 卡片整体可点（进入编辑），所以这两个控件必须各自吞掉冒泡，
-                        否则开关/删除会顺带触发编辑。把 stopPropagation 挂在控件自己
-                        身上，而不是套一层 div：套 div 会造出一个「看起来可交互但没有
-                        角色」的静态元素，既触发 a11y 告警，语义上也说不通。 */}
+                    {/* The whole card is clickable (opens the editor), so these two controls must each swallow the bubbling click,
+                        otherwise toggling/deleting would also trigger editing. stopPropagation hangs off the controls themselves
+                        rather than a wrapping div: a div wrapper would create a static element that "looks interactive but has no
+                        role", tripping a11y warnings and making no semantic sense either. */}
                     <div className="ml-auto flex items-center gap-2">
                       <Switch
                         checked={ch.enabled}
                         onCheckedChange={() => toggleEnabled(ch)}
                         onClick={(e) => e.stopPropagation()}
-                        aria-label={translate("notify.enable")}
+                        aria-label={t("Enable")}
                       />
                       <Button
                         size="icon"
                         variant="outline"
-                        aria-label={translate("notify.delete")}
+                        aria-label={t("Delete")}
                         onClick={(e) => {
                           e.stopPropagation();
-                          // void 显式丢弃 Promise：removeChannel 自己 catch 并 toast，
-                          // 这里不需要 await（onClick 不是 async）。
+                          // void explicitly discards the Promise: removeChannel catches and toasts on its own,
+                          // so no await is needed here (onClick is not async).
                           void removeChannel(ch);
                         }}
                       >
@@ -404,11 +464,9 @@ export default function NotifyPage() {
                 </CardHeader>
                 <CardContent className="grid gap-3">
                   <div className="flex flex-wrap items-center gap-2">
-                    <Badge variant="outline">{translate(KIND_LABEL[ch.kind] ?? ch.kind)}</Badge>
-                    <Badge variant="outline">
-                      {ch.mode === "digest" ? translate("notify.digest") : translate("notify.realtime")}
-                    </Badge>
-                    {!ch.enabled && <Badge variant="outline">{translate("notify.disabled")}</Badge>}
+                    <Badge variant="outline">{KIND_LABEL[ch.kind] ?? ch.kind}</Badge>
+                    <Badge variant="outline">{ch.mode === "digest" ? t("Digest") : t("Realtime")}</Badge>
+                    {!ch.enabled && <Badge variant="outline">{t("Disabled")}</Badge>}
                   </div>
                   <FilterSummary filter={ch.filter} />
                 </CardContent>
@@ -425,23 +483,22 @@ export default function NotifyPage() {
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetContent side="right" className="w-full data-[side=right]:sm:max-w-lg">
           <SheetHeader>
-            <SheetTitle>{editing ? editing.name : translate("notify.addNotificationChannel")}</SheetTitle>
+            <SheetTitle>{editing ? editing.name : t("Add notification channel")}</SheetTitle>
             <SheetDescription>
-              {translate(KIND_LABEL[form.kind] ?? form.kind)}
-              {defaultRate > 0
-                ? translate("notify.defaultRate", { count: defaultRate })
-                : translate("notify.unlimitedSuffix")}
+              {KIND_LABEL[form.kind] ?? form.kind}
+              {" · "}
+              {defaultRate > 0 ? t("default rate limit {rate}/min", { rate: defaultRate }) : t("no rate limit")}
             </SheetDescription>
           </SheetHeader>
 
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4">
             <div className="grid gap-4 py-4">
               <div className="grid gap-2">
-                <Label>{translate("notify.channelType")}</Label>
+                <Label>{t("Channel type")}</Label>
                 <Select
                   value={form.kind}
                   onValueChange={(v) => {
-                    // 换类型等于换一套凭据字段，不能把旧配置合并进来。
+                    // Switching type means switching to a different set of credential fields; the old config cannot be merged in.
                     setF({ kind: v, config: {} });
                   }}
                   disabled={!!editing}
@@ -452,26 +509,32 @@ export default function NotifyPage() {
                   <SelectContent>
                     {(meta?.kinds ?? []).map((k) => (
                       <SelectItem key={k.kind} value={k.kind}>
-                        {translate(KIND_LABEL[k.kind] ?? k.kind)}
+                        {KIND_LABEL[k.kind] ?? k.kind}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
-                {editing && <p className="text-muted-foreground text-xs">{translate("notify.channelTypeHelp")}</p>}
+                {editing && (
+                  <p className="text-muted-foreground text-xs">
+                    {t("The channel type cannot be changed — a different type means a different set of credentials; create a new channel instead.")}
+                  </p>
+                )}
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="n-name">{translate("notify.channelName")}</Label>
+                <Label htmlFor="n-name">{t("Channel name")}</Label>
                 <Input
                   id="n-name"
-                  placeholder={translate("notify.channelNameExample")}
+                  placeholder={t("Incident response group / Daily broadcast group")}
                   value={form.name}
                   onChange={(e) => setF({ name: e.target.value })}
                 />
               </div>
 
               {fields.length === 0 ? (
-                <p className="text-muted-foreground text-sm">{translate("notify.missingFields")}</p>
+                <p className="text-muted-foreground text-sm">
+                  {t("The form for this channel type is not defined yet (the frontend is missing a CHANNEL_FIELDS entry); add it and retry.")}
+                </p>
               ) : (
                 fields.map((d) => (
                   <ConfigField
@@ -485,37 +548,41 @@ export default function NotifyPage() {
               )}
 
               <div className="grid gap-2">
-                <Label>{translate("notify.timing")}</Label>
+                <Label>{t("Delivery timing")}</Label>
                 <Select value={form.mode} onValueChange={(v) => setF({ mode: v as "realtime" | "digest" })}>
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="realtime">{translate("notify.realtimeOption")}</SelectItem>
-                    <SelectItem value="digest">{translate("notify.digestOption")}</SelectItem>
+                    <SelectItem value="realtime">{t("Realtime · one message per finding")}</SelectItem>
+                    <SelectItem value="digest">{t("Digest · merged into one message per interval")}</SelectItem>
                   </SelectContent>
                 </Select>
-                <p className="text-muted-foreground text-xs">{translate("notify.timingHelp")}</p>
+                <p className="text-muted-foreground text-xs">
+                  {t("For \"realtime for High, digest for the rest\", create two channels: one realtime with a High threshold, one digest with no severity limit.")}
+                </p>
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="n-rate">{translate("notify.rateLimit")}</Label>
+                <Label htmlFor="n-rate">{t("Rate limit (messages/min)")}</Label>
                 <Input
                   id="n-rate"
                   type="number"
                   min={0}
-                  placeholder={defaultRate > 0 ? String(defaultRate) : translate("notify.unlimited")}
+                  placeholder={defaultRate > 0 ? String(defaultRate) : t("0 = unlimited")}
                   value={form.ratePerMin}
                   onChange={(e) => setF({ ratePerMin: e.target.value })}
                 />
-                <p className="text-muted-foreground text-xs">{translate("notify.rateHelp")}</p>
+                <p className="text-muted-foreground text-xs">
+                  {t("Leave empty to use the channel default; 0 means no limit. Going over the limit never drops messages, only delays them.")}
+                </p>
               </div>
 
               <div className="border-t pt-4">
-                <p className="mb-3 text-sm font-medium">{translate("notify.filterRules")}</p>
+                <p className="mb-3 text-sm font-medium">{t("Filter rules (empty = no filtering)")}</p>
                 <div className="grid gap-4">
                   <div className="grid gap-2">
-                    <Label>{translate("notify.minSeverity")}</Label>
+                    <Label>{t("Minimum severity")}</Label>
                     <Select
                       value={form.minSeverity || "all"}
                       onValueChange={(v) => setF({ minSeverity: v === "all" ? "" : v })}
@@ -526,34 +593,36 @@ export default function NotifyPage() {
                       <SelectContent>
                         {SEVERITY_OPTIONS.map((o) => (
                           <SelectItem key={o.value || "all"} value={o.value || "all"}>
-                            {translate(o.label)}
+                            {o.label}
                           </SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="n-inc">{translate("notify.includeTypes")}</Label>
+                    <Label htmlFor="n-inc">{t("Only these vulnerability types")}</Label>
                     <Textarea
                       id="n-inc"
-                      placeholder={translate("notify.includeExample")}
+                      placeholder={"SQL injection\ncommand execution"}
                       value={form.includeText}
                       onChange={(e) => setF({ includeText: e.target.value })}
                     />
-                    <p className="text-muted-foreground text-xs">{translate("notify.includeHelp")}</p>
+                    <p className="text-muted-foreground text-xs">
+                      {t("One keyword per line, matched case-insensitively as a substring. Leave empty for all types.")}
+                    </p>
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="n-exc">{translate("notify.excludeTypes")}</Label>
+                    <Label htmlFor="n-exc">{t("Exclude these vulnerability types")}</Label>
                     <Textarea
                       id="n-exc"
-                      placeholder={translate("notify.excludeExample")}
+                      placeholder={"Information disclosure"}
                       value={form.excludeText}
                       onChange={(e) => setF({ excludeText: e.target.value })}
                     />
-                    <p className="text-muted-foreground text-xs">{translate("notify.excludeHelp")}</p>
+                    <p className="text-muted-foreground text-xs">{t("Exclusion beats inclusion: an item matching both is excluded.")}</p>
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="n-tasks">{translate("notify.taskIds")}</Label>
+                    <Label htmlFor="n-tasks">{t("Restrict to task IDs")}</Label>
                     <Input
                       id="n-tasks"
                       placeholder="1, 2, 3"
@@ -562,43 +631,39 @@ export default function NotifyPage() {
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="n-assets">{translate("notify.assetIds")}</Label>
+                    <Label htmlFor="n-assets">{t("Restrict to asset IDs")}</Label>
                     <Input
                       id="n-assets"
                       placeholder="10, 11"
                       value={form.assetIDsText}
                       onChange={(e) => setF({ assetIDsText: e.target.value })}
                     />
-                    <p className="text-muted-foreground text-xs">{translate("notify.idsHelp")}</p>
+                    <p className="text-muted-foreground text-xs">{t("Empty task/asset = no restriction; when filled, the finding must intersect them.")}</p>
                   </div>
                   <div className="flex items-center gap-2 text-sm">
                     <Switch
                       checked={form.onStatusChange}
                       onCheckedChange={(v) => setF({ onStatusChange: v })}
-                      aria-label={translate("notify.statusChangesLabel")}
+                      aria-label={t("Include status changes")}
                     />
-                    {translate("notify.statusChangesHelp")}
+                    {t("Also push when a finding's status changes (realtime mode only)")}
                   </div>
                 </div>
               </div>
 
               <div className="flex items-center gap-2 text-sm">
-                <Switch
-                  checked={form.enabled}
-                  onCheckedChange={(v) => setF({ enabled: v })}
-                  aria-label={translate("notify.enable")}
-                />
-                {translate("notify.enableChannel")}
+                <Switch checked={form.enabled} onCheckedChange={(v) => setF({ enabled: v })} aria-label={t("Enable")} />
+                {t("Enable this channel")}
               </div>
             </div>
 
             <div className="flex gap-2 pt-2 pb-6">
               <Button onClick={saveForm} disabled={saving}>
-                {editing ? translate("notify.save") : translate("notify.add")}
+                {editing ? t("Save") : t("Add")}
               </Button>
               {editing && (
                 <Button variant="outline" onClick={testChannel} disabled={testing}>
-                  <SendIcon /> {translate("notify.test")}
+                  <SendIcon /> {t("Send test message")}
                 </Button>
               )}
             </div>

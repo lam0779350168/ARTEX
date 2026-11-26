@@ -1,4 +1,5 @@
 "use client";
+
 import * as React from "react";
 
 import Link from "next/link";
@@ -8,16 +9,12 @@ import {
   ChevronRightIcon,
   FileTextIcon,
   FlaskConicalIcon,
-  FolderIcon,
-  FolderOpenIcon,
   RotateCcwIcon,
   ShieldAlertIcon,
   Trash2Icon,
 } from "lucide-react";
-import { useTranslation } from "react-i18next";
 
 import { CopyButton } from "@/components/copy-button";
-import { FindingCaseMembers, FindingSeverityCounts } from "@/components/finding-case-list";
 import { Markdown } from "@/components/markdown";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -39,17 +36,17 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
-import { statusMeta } from "@/lib/status";
+import { statusMeta, type Tone, toneClasses } from "@/lib/status";
 import type {
   ActiveFindingRetest,
   Finding,
-  FindingAsset,
-  FindingCaseListRow,
+  FindingReportState,
   FindingStatus,
   Severity,
+  VerificationStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { intlLocale, t } from "@/i18n";
 
 export const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 
@@ -65,9 +62,79 @@ export const FINDING_STATUSES: FindingStatus[] = [
   "risk_accepted",
 ];
 
+export const VERIFICATION_STATUSES: VerificationStatus[] = [
+  "verified",
+  "unverified",
+  "blocked",
+  "not_assessed",
+  "false_positive",
+];
+
+export const FINDING_REPORT_STATES: FindingReportState[] = [
+  "none",
+  "submitted",
+  "accepted",
+  "rejected",
+  "duplicate",
+];
+
+export const REPORT_STATE_META: Record<FindingReportState, { label: string; tone: Tone }> = {
+  none: { label: t("Not submitted"), tone: "slate" },
+  submitted: { label: t("Submitted"), tone: "amber" },
+  accepted: { label: t("Accepted"), tone: "green" },
+  rejected: { label: t("Rejected"), tone: "red" },
+  duplicate: { label: t("Duplicate report"), tone: "neutral" },
+};
+
+export function ReportStateBadge({ state }: { state?: FindingReportState }) {
+  const value = state ?? "none";
+  const meta = REPORT_STATE_META[value] ?? REPORT_STATE_META.none;
+  return (
+    <span
+      className={cn(
+        "inline-flex w-fit items-center whitespace-nowrap rounded-md border px-2 py-0.5 font-medium text-xs",
+        toneClasses[meta.tone],
+      )}
+    >
+      {meta.label}
+    </span>
+  );
+}
+
+// Verification outcome → label/tone, on the same tone tokens StatusBadge uses.
+export const VERIFICATION_META: Record<VerificationStatus, { label: string; tone: Tone }> = {
+  verified: { label: t("Verified"), tone: "green" },
+  unverified: { label: t("Unverified"), tone: "slate" },
+  blocked: { label: t("Blocked"), tone: "amber" },
+  not_assessed: { label: t("Not assessed"), tone: "red" },
+  false_positive: { label: t("False positive"), tone: "neutral" },
+};
+
+// VerificationBadge shows the automated verification outcome ("Verified L3" when a
+// proof-of-exploitation level is declared). It renders nothing when the finding carries
+// no verification status (in-task nodes, payloads from before the column existed).
+export function VerificationBadge({ finding }: { finding: Pick<Finding, "verification_status" | "poe_level"> }) {
+  const meta = finding.verification_status ? VERIFICATION_META[finding.verification_status] : undefined;
+  if (!meta) return null;
+  const label =
+    finding.verification_status === "verified" && finding.poe_level
+      ? `${meta.label} L${finding.poe_level}`
+      : meta.label;
+  return (
+    <span
+      className={cn(
+        "inline-flex w-fit items-center whitespace-nowrap rounded-md border px-2 py-0.5 font-medium text-xs",
+        toneClasses[meta.tone],
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
 export const UNASSIGNED_TASK = "__unassigned__";
 
-// 行内编辑缓冲:当前展开行的名称/类别/严重等级。
+// Inline edit buffer: the expanded row's name/category/severity.
 export interface FindingEdit {
   name: string;
   vulnclass: string;
@@ -75,12 +142,6 @@ export interface FindingEdit {
 }
 
 export type FindingReport = { status: "loading" | "done" | "error"; text: string };
-
-function isStructuredReproductionReport(report: string) {
-  return (
-    /^##\s+(?:复现步骤|测试过程|复现过程)\s*$/im.test(report) && /^\s*(?:###\s*)?步骤\s*\d+[.、:：)）]/im.test(report)
-  );
-}
 
 // Exploration node ids are only unique inside a task. Prefer the persisted
 // finding id and otherwise namespace the node id by task so editing one group
@@ -94,8 +155,8 @@ export function isSameFinding(left: Finding, right: Finding): boolean {
   return findingRowKey(left) === findingRowKey(right);
 }
 
-export function fmtTime(ts: string, ui: UITranslate) {
-  return new Date(ts).toLocaleString(ui("screen.91610255157661"), {
+export function fmtTime(ts: string) {
+  return new Date(ts).toLocaleString(intlLocale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -103,18 +164,14 @@ export function fmtTime(ts: string, ui: UITranslate) {
   });
 }
 
-const COLUMN_COUNT = 9;
+const COLUMN_COUNT = 10;
 
 interface FindingsTableProps {
   items: Finding[];
-  caseRows?: FindingCaseListRow[];
-  hideHeader?: boolean;
-  matchedIds?: number[];
-  presentation?: "records" | "task" | "asset";
   selectedIds: Set<string>;
   onToggleSelected: (id: string, checked: boolean) => void;
   onToggleSelectedPage: (ids: string[], checked: boolean) => void;
-  /** 当前展开行的 findingRowKey;null = 全部收起。 */
+  /** The expanded row's findingRowKey; null = all collapsed. */
   expandedKey: string | null;
   onToggleRow: (finding: Finding) => void;
   reports: Record<string, FindingReport>;
@@ -123,22 +180,19 @@ interface FindingsTableProps {
   saving: boolean;
   onSave: (finding: Finding) => void;
   onStatusChange: (finding: Finding, next: FindingStatus) => void;
+  onReportStateChange: (finding: Finding, next: FindingReportState) => void;
   onRetest: (finding: Finding) => void;
   activeRetests: Record<string, ActiveFindingRetest>;
   onDeepen: (finding: Finding) => void;
   onDelete: (finding: Finding) => void;
-  /** 全选框的无障碍标签,平铺视图与分组视图措辞不同。 */
+  /** The select-all checkbox's accessibility label; the flat and grouped views word it differently. */
   selectAllLabel?: string;
 }
 
-// FindingsTable 是发现列表的表格主体,平铺视图与按任务分组视图共用同一份行渲染
-// (勾选 / 行内展开 / 行内改名与改状态 / 复测 / 深入 / 删除),差异只在外层容器与分页。
+// FindingsTable is the findings list's table body; the flat view and the grouped-by-task view share the same row rendering
+// (selection / inline expand / rename & status change / retest / deepen / delete), differing only in the outer container and pagination.
 export function FindingsTable({
   items,
-  caseRows,
-  hideHeader = false,
-  matchedIds,
-  presentation = "records",
   selectedIds,
   onToggleSelected,
   onToggleSelectedPage,
@@ -150,17 +204,13 @@ export function FindingsTable({
   saving,
   onSave,
   onStatusChange,
+  onReportStateChange,
   onRetest,
   activeRetests,
   onDeepen,
   onDelete,
-  selectAllLabel,
+  selectAllLabel = t("Select all on this page"),
 }: FindingsTableProps) {
-  const { ui } = useUITranslation();
-
-  selectAllLabel ??= ui("screen.bc039dd5faffdd");
-
-  const { t } = useTranslation();
   const selectableIds = items.map((finding) => finding.finding_id).filter((id): id is string => Boolean(id));
   const selectedCount = selectableIds.filter((id) => selectedIds.has(id)).length;
   let headerChecked: boolean | "indeterminate" = false;
@@ -170,79 +220,38 @@ export function FindingsTable({
     headerChecked = "indeterminate";
   }
 
-  const rows: FindingCaseListRow[] = caseRows ?? items.map((finding) => ({ finding, matched_ids: [] }));
-
-  const shared: Omit<FindingsTableProps, "items" | "caseRows"> = {
-    presentation,
-    selectedIds,
-    onToggleSelected,
-    onToggleSelectedPage,
-    expandedKey,
-    onToggleRow,
-    reports,
-    edit,
-    onEditChange,
-    saving,
-    onSave,
-    onStatusChange,
-    onRetest,
-    activeRetests,
-    onDeepen,
-    onDelete,
-  };
-
   return (
-    /* 固定列宽保证展开内容不撑开表格；窄屏只在表格内部横向滚动。 */
-    <Table className="min-w-[60rem] table-fixed">
-      {hideHeader ? (
-        <colgroup>
-          <col className="w-8" />
-          <col className="w-8" />
-          <col className="w-20" />
-          <col />
-          <col className="w-44" />
-          <col className="w-28" />
-          <col className="w-32" />
-          <col className="w-24" />
-          <col className="w-48" />
-        </colgroup>
-      ) : null}
-      {!hideHeader ? (
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-8">
-              <Checkbox
-                checked={headerChecked}
-                onCheckedChange={(checked) => onToggleSelectedPage(selectableIds, checked === true)}
-                aria-label={selectAllLabel}
-              />
-            </TableHead>
-            <TableHead className="w-8" />
-            <TableHead className="w-20">{ui("screen.367839ef9f8c2f")}</TableHead>
-            <TableHead>{ui("screen.f9d4d157ae40c7")}</TableHead>
-            <TableHead className="w-44">{ui("screen.5f45bb826b168f")}</TableHead>
-            <TableHead className="w-28">{ui("screen.6320b4a8722a85")}</TableHead>
-            <TableHead className="w-32">{ui("screen.9f232c4d19886f")}</TableHead>
-            <TableHead className="w-24">{ui("screen.8b6ff498515bcc")}</TableHead>
-            <TableHead className="w-48">{ui("screen.ed31fbb483ee1b")}</TableHead>
-          </TableRow>
-        </TableHeader>
-      ) : null}
+    /* Fixed column widths keep expanded content from stretching the table; narrow screens scroll horizontally inside the table only. */
+    <Table className="min-w-[68rem] table-fixed">
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-8">
+            <Checkbox
+              checked={headerChecked}
+              onCheckedChange={(checked) => onToggleSelectedPage(selectableIds, checked === true)}
+              aria-label={selectAllLabel}
+            />
+          </TableHead>
+          <TableHead className="w-8" />
+          <TableHead className="w-20">{t("Severity")}</TableHead>
+          <TableHead>{t("Vulnerability")}</TableHead>
+          <TableHead className="w-44">{t("Asset")}</TableHead>
+          <TableHead className="w-28">{t("Status")}</TableHead>
+          <TableHead className="w-36">{t("Report")}</TableHead>
+          <TableHead className="w-32">{t("Task")}</TableHead>
+          <TableHead className="w-24">{t("Time")}</TableHead>
+          <TableHead className="w-48">{t("Actions")}</TableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
-        {rows.map((row) => {
-          if (row.case) return <FindingFolderTableRows key={`case:${row.case.id}`} row={row} shared={shared} />;
-          const f = row.finding;
-          if (!f) return null;
+        {items.map((f) => {
           const rowKey = findingRowKey(f);
           const open = expandedKey === rowKey;
           const retest = f.finding_id ? activeRetests[f.finding_id] : undefined;
           return (
             <React.Fragment key={rowKey}>
               <TableRow
-                className={cn(
-                  "cursor-pointer",
-                  matchedIds && !matchedIds.includes(Number(f.finding_id)) && "bg-muted/30",
-                )}
+                className="cursor-pointer"
                 role="button"
                 tabIndex={0}
                 aria-expanded={open}
@@ -258,7 +267,7 @@ export function FindingsTable({
                     <Checkbox
                       checked={selectedIds.has(f.finding_id)}
                       onCheckedChange={(c) => onToggleSelected(f.finding_id as string, c === true)}
-                      aria-label={ui("screen.f535063ffeb25d")}
+                      aria-label={t("Select this vulnerability")}
                     />
                   )}
                 </TableCell>
@@ -277,29 +286,39 @@ export function FindingsTable({
                         href={`/function/findings/detail?id=${f.finding_id}`}
                         onClick={(e) => e.stopPropagation()}
                         className="truncate font-medium hover:text-primary hover:underline"
-                        title={ui("screen.232a97b3cf149e")}
+                        title={t("View finding details")}
                       >
-                        {f.name || f.vulnclass || ui("screen.54b89f90127458")}
+                        {f.name || f.vulnclass || t("Uncategorized")}
                       </Link>
                     ) : (
-                      <span className="truncate font-medium">
-                        {f.name || f.vulnclass || ui("screen.54b89f90127458")}
-                      </span>
+                      <span className="truncate font-medium">{f.name || f.vulnclass || t("Uncategorized")}</span>
                     )}
                     <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
-                    {matchedIds && !matchedIds.includes(Number(f.finding_id)) ? (
-                      <Badge variant="outline" className="w-fit">
-                        {ui("screen.7852ff0b787df8")}
-                      </Badge>
-                    ) : null}
-                    <Badge variant="outline">
-                      {ui("screen.8a7bc1e3a1c1dd")}
-                      {f.traffic_count ?? 0} {ui("screen.f004f1d84cf962")}
-                    </Badge>
+                    <div className="flex flex-wrap items-center gap-1">
+                      <Badge variant="outline">{t("Traffic evidence: {count}", { count: f.traffic_count ?? 0 })}</Badge>
+                      <VerificationBadge finding={f} />
+                    </div>
                   </div>
                 </TableCell>
                 <TableCell>
-                  <FindingAssetLabels assets={f.assets} />
+                  {f.assets && f.assets.length > 0 ? (
+                    <div className="flex flex-wrap gap-1">
+                      {f.assets.slice(0, 3).map((a) => (
+                        <code
+                          key={a.id}
+                          className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs"
+                          title={`${a.type} · ${a.label}`}
+                        >
+                          {a.label}
+                        </code>
+                      ))}
+                      {f.assets.length > 3 && (
+                        <span className="text-xs text-muted-foreground">+{f.assets.length - 3}</span>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
                 </TableCell>
                 <TableCell onClick={(e) => e.stopPropagation()}>
                   {f.finding_id ? (
@@ -310,13 +329,34 @@ export function FindingsTable({
                       <SelectContent position="popper" align="end">
                         {FINDING_STATUSES.map((st) => (
                           <SelectItem key={st} value={st}>
-                            {statusMeta("finding", st, t).label}
+                            {statusMeta("finding", st).label}
                           </SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
                   ) : (
                     <StatusBadge domain="finding" value={f.status} dot />
+                  )}
+                </TableCell>
+                <TableCell onClick={(e) => e.stopPropagation()}>
+                  {f.finding_id ? (
+                    <Select
+                      value={f.report_state ?? "none"}
+                      onValueChange={(v) => onReportStateChange(f, v as FindingReportState)}
+                    >
+                      <SelectTrigger size="sm" className="h-7 w-full border-none px-1 shadow-none focus-visible:ring-0">
+                        <ReportStateBadge state={f.report_state} />
+                      </SelectTrigger>
+                      <SelectContent position="popper" align="end">
+                        {FINDING_REPORT_STATES.map((st) => (
+                          <SelectItem key={st} value={st}>
+                            {REPORT_STATE_META[st].label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <ReportStateBadge state={f.report_state} />
                   )}
                 </TableCell>
                 <TableCell>
@@ -334,27 +374,32 @@ export function FindingsTable({
                     <span className="text-muted-foreground">—</span>
                   )}
                 </TableCell>
-                <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(f.ts, ui)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(f.ts)}</TableCell>
                 <TableCell onClick={(e) => e.stopPropagation()}>
                   <div className="flex items-center gap-1">
                     {retest ? (
                       <Button asChild size="sm" variant="ghost">
-                        <Link href={`/chat?c=${retest.conversation_id}`} title={ui("screen.5a43849420b2d1")}>
+                        <Link href={`/chat?c=${retest.conversation_id}`} title={t("View the retest in progress")}>
                           <Spinner data-icon="inline-start" />
-                          {ui("screen.9426ed1cf45977")}
+                          {t("Retesting")}
                         </Link>
                       </Button>
                     ) : null}
                     {!retest && f.finding_id && !f.inherited ? (
-                      <Button size="sm" variant="ghost" onClick={() => onRetest(f)} title={ui("screen.1fa76681c39c38")}>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => onRetest(f)}
+                        title={t("Retest this vulnerability in a separate conversation")}
+                      >
                         <RotateCcwIcon data-icon="inline-start" />
-                        {ui("screen.d95315ddeb80c2")}
+                        {t("Retest")}
                       </Button>
                     ) : null}
                     {f.finding_id && f.task_id && (
                       <Button size="sm" variant="ghost" onClick={() => onDeepen(f)}>
                         <FlaskConicalIcon data-icon="inline-start" />
-                        {ui("screen.e952e0cafb0e8a")}
+                        {t("Deepen")}
                       </Button>
                     )}
                     {f.finding_id && (
@@ -364,27 +409,24 @@ export function FindingsTable({
                             size="icon"
                             variant="ghost"
                             className="size-7 text-muted-foreground hover:text-destructive"
-                            aria-label={ui("screen.623b2dfaaa3ba0")}
+                            aria-label={t("Delete vulnerability")}
                           >
                             <Trash2Icon className="size-4" />
                           </Button>
                         </AlertDialogTrigger>
                         <AlertDialogContent>
                           <AlertDialogHeader>
-                            <AlertDialogTitle>{ui("screen.fa4ee33b1be3d3")}</AlertDialogTitle>
-                            <AlertDialogDescription className="break-words">
-                              {ui("punctuation.b269e4a091")}
-                              <span className="break-all">
-                                {f.name || f.vulnclass || f.summary || `#${f.finding_id}`}
-                              </span>
-                              {ui("screen.10177194107fe4")}
+                            <AlertDialogTitle>{t("Delete this vulnerability?")}</AlertDialogTitle>
+                            <AlertDialogDescription className="[overflow-wrap:anywhere]">
+                              {t(
+                                '"{name}" will be permanently deleted and removed from the findings list, the task findings tab, and the exploration graph. This action cannot be undone.',
+                                { name: f.name || f.vulnclass || f.summary || `#${f.finding_id}` },
+                              )}
                             </AlertDialogDescription>
                           </AlertDialogHeader>
                           <AlertDialogFooter>
-                            <AlertDialogCancel>{ui("screen.2cd0f3be8738a8")}</AlertDialogCancel>
-                            <AlertDialogAction onClick={() => onDelete(f)}>
-                              {ui("screen.2f9daa828907b9")}
-                            </AlertDialogAction>
+                            <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
+                            <AlertDialogAction onClick={() => onDelete(f)}>{t("Delete")}</AlertDialogAction>
                           </AlertDialogFooter>
                         </AlertDialogContent>
                       </AlertDialog>
@@ -394,31 +436,31 @@ export function FindingsTable({
               </TableRow>
               {open && (
                 <TableRow className="hover:bg-transparent">
-                  {/* whitespace-normal 覆盖 TableCell 默认的 nowrap,否则展开区文字
-                      被强制单行、直接溢出单元格。 */}
+                  {/* whitespace-normal overrides TableCell's default nowrap, otherwise the expanded area's text
+                      is forced onto one line and overflows the cell. */}
                   <TableCell colSpan={COLUMN_COUNT} className="bg-muted/30 whitespace-normal">
                     <div className="flex flex-col gap-2 px-2 py-1">
-                      {/* 行内编辑:名称/类别/严重等级,可改并保存(仅独立 finding 行)。 */}
+                      {/* Inline edit: name/category/severity, editable and savable (standalone finding rows only). */}
                       {f.finding_id && edit && (
                         <div className="flex flex-wrap items-end gap-3 rounded-md border bg-background px-3 py-2.5">
                           <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
-                            <Label className="text-xs text-muted-foreground">{ui("screen.f9d4d157ae40c7")}</Label>
+                            <Label className="text-xs text-muted-foreground">{t("Vulnerability")}</Label>
                             <Input
                               value={edit.name}
                               onChange={(e) => onEditChange((s) => (s ? { ...s, name: e.target.value } : s))}
-                              placeholder={ui("screen.e4ca1c94d239bd")}
+                              placeholder={t("Readable title; falls back to category when empty")}
                             />
                           </div>
                           <div className="flex min-w-[10rem] flex-col gap-1">
-                            <Label className="text-xs text-muted-foreground">{ui("screen.0d12cbd6562bfb")}</Label>
+                            <Label className="text-xs text-muted-foreground">{t("Category")}</Label>
                             <Input
                               value={edit.vulnclass}
                               onChange={(e) => onEditChange((s) => (s ? { ...s, vulnclass: e.target.value } : s))}
-                              placeholder={ui("screen.18f8e077cc27a6")}
+                              placeholder={t("e.g. SQL Injection")}
                             />
                           </div>
                           <div className="flex flex-col gap-1">
-                            <Label className="text-xs text-muted-foreground">{ui("screen.2e21284b7229e6")}</Label>
+                            <Label className="text-xs text-muted-foreground">{t("Severity")}</Label>
                             <Select
                               value={edit.severity}
                               onValueChange={(v) => onEditChange((s) => (s ? { ...s, severity: v as Severity } : s))}
@@ -429,30 +471,30 @@ export function FindingsTable({
                               <SelectContent>
                                 {SEVERITIES.map((sv) => (
                                   <SelectItem key={sv} value={sv}>
-                                    {statusMeta("severity", sv, t).label}
+                                    {statusMeta("severity", sv).label}
                                   </SelectItem>
                                 ))}
                               </SelectContent>
                             </Select>
                           </div>
                           <Button size="sm" disabled={saving} onClick={() => onSave(f)}>
-                            {saving ? ui("screen.ff509c9ba052a2") : ui("screen.a3030bf8f16dc6")}
+                            {saving ? t("Saving…") : t("Save")}
                           </Button>
                         </div>
                       )}
                       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                         <ShieldAlertIcon className="size-3.5" />
-                        {ui("screen.d883c636d3f891")}
+                        {t("Evidence")}
                         {f.vulnclass && (
                           <span>
-                            {ui("screen.e9b150245e3845")}
+                            · {t("Type:")}
                             <code className="rounded bg-muted px-1.5 py-0.5 font-mono">{f.vulnclass}</code>
                           </span>
                         )}
                         {f.param_id && <code className="rounded bg-muted px-1.5 py-0.5 font-mono">{f.param_id}</code>}
                         {f.assets && f.assets.length > 0 && (
                           <span className="flex flex-wrap items-center gap-1">
-                            {ui("screen.a85936ba84b226")}
+                            · {t("Assets:")}
                             {f.assets.map((a) => (
                               <code key={a.id} className="rounded bg-muted px-1.5 py-0.5 font-mono" title={a.type}>
                                 {a.label}
@@ -465,18 +507,18 @@ export function FindingsTable({
                         {f.evidence}
                       </pre>
 
-                      {/* 旧版详细报告保留；新版合并报告在详情页按概览/步骤/根因/修复展示。 */}
-                      {f.finding_id && !isStructuredReproductionReport(reports[rowKey]?.text ?? "") && (
+                      {/* Detailed report (Markdown): lazily loaded by finding_id on expand, viewable without entering the detail page. */}
+                      {f.finding_id && (
                         <div className="flex flex-col gap-1.5">
                           <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                             <span className="flex items-center gap-2">
                               <FileTextIcon className="size-3.5" />
-                              {ui("screen.566e5ab4ab0638")}
+                              {t("Detailed report")}
                             </span>
                             {reports[rowKey]?.status === "done" && reports[rowKey]?.text.trim() && (
                               <CopyButton
                                 text={reports[rowKey]?.text}
-                                successMessage={ui("screen.10a2e40390af5f")}
+                                successMessage={t("Detailed report copied")}
                                 variant="ghost"
                                 className="h-6 px-2 text-xs"
                               />
@@ -485,15 +527,15 @@ export function FindingsTable({
                           {(() => {
                             const rep = reports[rowKey];
                             if (!rep || rep.status === "loading")
-                              return <p className="text-xs text-muted-foreground">{ui("screen.4927a53bcc886a")}</p>;
+                              return <p className="text-xs text-muted-foreground">{t("Loading…")}</p>;
                             if (rep.status === "error")
-                              return <p className="text-xs text-muted-foreground">{ui("screen.bf456ab5176d85")}</p>;
+                              return <p className="text-xs text-muted-foreground">{t("Failed to load the report.")}</p>;
                             if (!rep.text.trim())
-                              return <p className="text-xs text-muted-foreground">{ui("screen.6283d9ab225878")}</p>;
+                              return <p className="text-xs text-muted-foreground">{t("No detailed report yet.")}</p>;
                             return (
-                              // break-words 会继承到段落/列表,pre 另加
-                              // whitespace-pre-wrap 让代码块也换行——否则长代码行/长 URL
-                              // 会撑宽 colSpan 单元格,把整张表挤出横向滚动条。
+                              // break-words inherits into paragraphs/lists; pre additionally gets
+                              // whitespace-pre-wrap so code blocks wrap too — otherwise long code lines/URLs
+                              // would stretch the colSpan cell and push the whole table into horizontal scrolling.
                               <div className="min-w-0 break-words rounded-md border bg-background px-3 py-2 [&_pre]:whitespace-pre-wrap">
                                 <Markdown text={rep.text} />
                               </div>
@@ -508,155 +550,14 @@ export function FindingsTable({
             </React.Fragment>
           );
         })}
-        {(caseRows ? caseRows.length : items.length) === 0 && (
+        {items.length === 0 && (
           <TableRow>
             <TableCell colSpan={COLUMN_COUNT} className="py-12 text-center text-sm text-muted-foreground">
-              {ui("screen.839ae9d1758f4a")}
+              {t("No matching findings.")}
             </TableCell>
           </TableRow>
         )}
       </TableBody>
     </Table>
-  );
-}
-
-// Ordinary reports and merged folders share one asset presentation, including
-// truncation and overflow counts, so labels align in every table view.
-function FindingAssetLabels({
-  assets = [],
-  totalCount = assets.length,
-}: {
-  assets?: FindingAsset[];
-  totalCount?: number;
-}) {
-  if (assets.length === 0) return <span className="text-muted-foreground">—</span>;
-  const visibleAssets = assets.slice(0, 3);
-  const remaining = Math.max(totalCount, assets.length) - visibleAssets.length;
-  return (
-    <div className="flex min-w-0 flex-wrap gap-1">
-      {visibleAssets.map((asset) => (
-        <code
-          key={asset.id}
-          className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs"
-          title={`${asset.type} · ${asset.label}`}
-        >
-          {asset.label}
-        </code>
-      ))}
-      {remaining > 0 ? <span className="text-xs text-muted-foreground">+{remaining}</span> : null}
-    </div>
-  );
-}
-
-// Folder summaries occupy the same columns as the current view's ordinary rows.
-// Expanded members reuse those rows without a second heading or column header.
-function FindingFolderTableRows({
-  row,
-  shared,
-}: {
-  row: FindingCaseListRow;
-  shared: Omit<FindingsTableProps, "items" | "caseRows">;
-}) {
-  const { ui } = useUITranslation();
-
-  const [open, setOpen] = React.useState(false);
-  const group = row.case;
-  if (!group) return null;
-  // Match the current table's ordinary rows, which display the task description.
-  const taskLabel = row.task_description;
-  const assets = row.assets ?? [];
-  const assetCount = row.asset_count ?? assets.length;
-  return (
-    <>
-      <TableRow className={cn(open && "bg-muted/60")}>
-        <TableCell />
-        <TableCell>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            aria-controls={`finding-table-members-${group.id}`}
-            aria-label={`${open ? ui("screen.afd4b783536b82") : ui("screen.00bd3960fea8ea")}${group.title}`}
-          >
-            <ChevronRightIcon className={cn("size-4 transition-transform", open && "rotate-90")} />
-          </Button>
-        </TableCell>
-        <TableCell>
-          <FindingSeverityCounts counts={group} />
-        </TableCell>
-        <TableCell>
-          <div className="flex min-w-0 items-start gap-2">
-            {open ? (
-              <FolderOpenIcon className="mt-0.5 size-4 shrink-0 text-primary" />
-            ) : (
-              <FolderIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            )}
-            <div className="flex min-w-0 flex-col gap-0.5">
-              <Link
-                className="truncate font-medium hover:text-primary hover:underline"
-                title={group.title}
-                href={`/function/findings/case?id=${group.id}`}
-              >
-                {group.title}
-              </Link>
-              <span className="truncate text-muted-foreground text-xs">
-                {group.count} {ui("screen.0ebb9fd0cad94e")}
-                {group.report_version !== group.version ? ui("screen.99c01379e8e143") : ui("screen.632e3cdf7f317c")}
-              </span>
-            </div>
-          </div>
-        </TableCell>
-        <TableCell>
-          <FindingAssetLabels assets={assets} totalCount={assetCount} />
-        </TableCell>
-        <TableCell>
-          <span className="text-muted-foreground" title={ui("screen.1ae6e90569357d")}>
-            —
-          </span>
-        </TableCell>
-        <TableCell>
-          {group.task_id ? (
-            <Link
-              className="inline-flex max-w-full items-center gap-1 text-primary hover:underline"
-              title={taskLabel}
-              href={`/function/tasks/detail?id=${group.task_id}`}
-            >
-              <span className="truncate">{taskLabel}</span>
-              <ArrowUpRightIcon className="size-3 shrink-0" />
-            </Link>
-          ) : (
-            <span className="text-muted-foreground">—</span>
-          )}
-        </TableCell>
-        <TableCell className="text-muted-foreground text-xs tabular-nums">
-          {row.last_found_at ? fmtTime(row.last_found_at, ui) : "—"}
-        </TableCell>
-        <TableCell>
-          <Button asChild size="sm" variant="ghost">
-            <Link href={`/function/findings/case?id=${group.id}`}>{ui("screen.37707567ad4c9b")}</Link>
-          </Button>
-        </TableCell>
-      </TableRow>
-      {open ? (
-        <TableRow>
-          <TableCell colSpan={COLUMN_COUNT} className="whitespace-normal bg-muted/20 px-4 py-4">
-            <section
-              id={`finding-table-members-${group.id}`}
-              aria-label={ui("screen.9a800fb52c2cf7", { v0: group.title })}
-            >
-              <FindingCaseMembers
-                caseId={group.id}
-                version={group.version}
-                nested
-                renderRecords={(members) => (
-                  <FindingsTable {...shared} items={members} matchedIds={row.matched_ids} hideHeader />
-                )}
-              />
-            </section>
-          </TableCell>
-        </TableRow>
-      ) : null}
-    </>
   );
 }

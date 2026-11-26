@@ -25,21 +25,25 @@ import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/componen
 import { Skeleton } from "@/components/ui/skeleton";
 import { useIsMobile } from "@/hooks/use-mobile";
 import type { SideQuestions } from "@/hooks/use-side-questions";
-import { localizedError } from "@/i18n/errors";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
+import { intlLocale, t } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 type ComposerLayout = "inline" | "stacked";
-type SuggestedQuestion = string | { label: string; question: string };
 
-export function SideQuestionButton({ side, label }: { side: SideQuestions; label?: string }) {
-  const { t: translate } = useLiveTranslation();
-  const displayLabel = label ?? translate("chatUI.sideQuestion");
+const preparationLabels = {
+  preparing: t("Preparing context…"),
+  summarizing_history: t("Summarizing earlier side Q&A…"),
+  compressing_snapshot: t("Compressing the side-question context copy…"),
+  retrying: t("Model context exceeded, shrinking and retrying…"),
+  answering: t("Answering…"),
+};
+
+export function SideQuestionButton({ side }: { side: SideQuestions }) {
   if (!side.enabled) return null;
   return (
-    <Button variant="outline" size="sm" onClick={() => side.setOpen(true)} title={`/btw ${displayLabel}`}>
+    <Button variant="outline" size="sm" onClick={() => side.setOpen(true)} title={t("/btw side question")}>
       <MessageCircleQuestionIcon data-icon="inline-start" />
-      {displayLabel}
+      {t("Side question")}
     </Button>
   );
 }
@@ -48,28 +52,11 @@ function SidePanel({
   side,
   label,
   composerLayout,
-  suggestions,
-  placeholder,
-  noSnapshotHint,
-  emptyDescription,
 }: {
   side: SideQuestions;
   label: string;
   composerLayout: ComposerLayout;
-  suggestions?: SuggestedQuestion[];
-  placeholder?: string;
-  noSnapshotHint?: string;
-  emptyDescription?: string;
 }) {
-  const { t: translate, i18n } = useLiveTranslation();
-  const preparationLabels = {
-    preparing: translate("chatUI.preparing"),
-    summarizing_history: translate("chatUI.summarizingHistory"),
-    compressing_snapshot: translate("chatUI.compressingSnapshot"),
-    retrying: translate("chatUI.retrying"),
-    answering: translate("chatUI.answering"),
-  };
-
   const inlineComposer = composerLayout === "inline";
   const [confirm, setConfirm] = useState(false);
   const viewport = useRef<HTMLDivElement>(null);
@@ -80,18 +67,18 @@ function SidePanel({
     if (pinned.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
   }, [tail?.answer, tail?.id]);
   const status = {
-    running: translate("chatUI.status.running"),
-    completed: translate("chatUI.status.completed"),
-    failed: translate("chatUI.status.failed"),
-    cancelled: translate("chatUI.status.cancelled"),
-    interrupted: translate("chatUI.status.interrupted"),
+    running: t("Answering"),
+    completed: t("Completed"),
+    failed: t("Failed"),
+    cancelled: t("Stopped"),
+    interrupted: t("Interrupted"),
   };
   return (
-    <section className="flex h-full min-h-0 flex-col bg-background" aria-label={translate("chatUI.panel")}>
+    <section className="flex h-full min-h-0 flex-col bg-background" aria-label={t("Side question panel")}>
       <div className="flex items-center gap-2 border-b p-3">
         <div className="min-w-0 flex-1">
           <p className="font-medium">
-            {translate("chatUI.sideQuestion")} <span className="text-muted-foreground">/btw</span>
+            {t("Side question")} <span className="text-muted-foreground">/btw</span>
           </p>
           <p className="truncate text-muted-foreground text-xs">{label}</p>
         </div>
@@ -100,31 +87,22 @@ function SidePanel({
           size="icon-sm"
           onClick={() => setConfirm(true)}
           disabled={!side.items.length || side.busy}
-          aria-label={translate("chatUI.clearLabel")}
+          aria-label={t("Clear side-question history")}
         >
           <Trash2Icon />
         </Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={() => side.setOpen(false)}
-          aria-label={translate("chatUI.closePanel")}
-        >
+        <Button variant="ghost" size="icon-sm" onClick={() => side.setOpen(false)} aria-label={t("Close side-question panel")}>
           <XIcon />
         </Button>
       </div>
       <div className="border-b px-3 py-2 text-muted-foreground text-xs">
-        {side.snapshot?.available ? (
+        {side.snapshot ? (
           <>
             <p>{side.snapshot.model.model}</p>
-            <p>
-              {translate("chatUI.contextUpdated", {
-                date: new Date(side.snapshot.captured_at).toLocaleString(i18n.resolvedLanguage),
-              })}
-            </p>
+            <p>{t("Context updated {time}", { time: new Date(side.snapshot.captured_at).toLocaleString(intlLocale) })}</p>
           </>
         ) : (
-          (noSnapshotHint ?? translate("chatUI.noSnapshot"))
+          t("Ask anytime after the main agent's first run")
         )}
       </div>
       <div
@@ -137,15 +115,15 @@ function SidePanel({
       >
         {side.nextCursor > 0 && (
           <Button variant="ghost" size="sm" onClick={() => void side.load(side.nextCursor)}>
-            {translate("chatUI.loadEarlier")}
+            {t("Load earlier side Q&A")}
           </Button>
         )}
         {side.loading && <Skeleton className="h-16 w-full" />}
         {!side.loading && side.items.length === 0 && (
           <Empty>
             <EmptyHeader>
-              <EmptyTitle>{translate("chatUI.askAnytime")}</EmptyTitle>
-              <EmptyDescription>{emptyDescription ?? translate("chatUI.description")}</EmptyDescription>
+              <EmptyTitle>{t("Ask a question anytime")}</EmptyTitle>
+              <EmptyDescription>{t("Answered from the current agent's context while the main task keeps running.")}</EmptyDescription>
             </EmptyHeader>
           </Empty>
         )}
@@ -156,20 +134,15 @@ function SidePanel({
               <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs">
                 <Badge variant="secondary">{status[item.status]}</Badge>
                 <span className="truncate">{item.model.model}</span>
-                <time
-                  dateTime={item.snapshot_at}
-                  title={new Date(item.snapshot_at).toLocaleString(i18n.resolvedLanguage)}
-                >
-                  {translate("chatUI.contextTime", {
-                    time: new Date(item.snapshot_at).toLocaleTimeString(i18n.resolvedLanguage),
-                  })}
+                <time dateTime={item.snapshot_at} title={new Date(item.snapshot_at).toLocaleString(intlLocale)}>
+                  {t("Context {time}", { time: new Date(item.snapshot_at).toLocaleTimeString(intlLocale) })}
                 </time>
               </div>
               {item.context?.estimated_input_tokens != null && (
                 <p className="text-muted-foreground text-xs">
-                  {translate("chatUI.recentExchanges", { count: item.context.recent_exchanges })}
-                  {item.context.history_summarized && translate("chatUI.historySummary")}
-                  {item.context.snapshot_summarized && translate("chatUI.snapshotSummary")}
+                  {t("Last {count} Q&A exchanges verbatim", { count: item.context.recent_exchanges })}
+                  {item.context.history_summarized && ` · ${t("earlier Q&A summarized")}`}
+                  {item.context.snapshot_summarized && ` · ${t("uses the main-context digest")}`}
                 </p>
               )}
               {item.answer && <Markdown text={item.answer} />}
@@ -180,7 +153,7 @@ function SidePanel({
               )}
               {item.error && (
                 <Alert variant="destructive">
-                  <AlertDescription>{localizedError(item.error, translate)}</AlertDescription>
+                  <AlertDescription>{item.error}</AlertDescription>
                 </Alert>
               )}
             </article>
@@ -188,19 +161,17 @@ function SidePanel({
         </div>
       </div>
       <div className="shrink-0 border-t p-3">
-        {(side.error || side.snapshotError || side.snapshot?.reason) && (
+        {(side.error || side.snapshot?.reason) && (
           <Alert variant="destructive" className="mb-2">
-            <AlertDescription>
-              {localizedError(side.error || side.snapshotError || side.snapshot?.reason || "", translate)}
-            </AlertDescription>
+            <AlertDescription>{side.error || side.snapshot?.reason}</AlertDescription>
           </Alert>
         )}
         <InputGroup className={inlineComposer ? "min-h-10" : "min-h-9"}>
           <InputGroupTextarea
             rows={1}
             className={cn("overflow-y-auto", inlineComposer ? "max-h-40 min-h-0" : "max-h-36 min-h-9")}
-            aria-label={translate("chatUI.questionLabel")}
-            placeholder={placeholder ?? translate("chatUI.questionPlaceholder")}
+            aria-label={t("Side question")}
+            placeholder={t("Ask about the current context…")}
             value={side.draft}
             maxLength={4000}
             disabled={side.busy}
@@ -213,14 +184,14 @@ function SidePanel({
             }}
           />
           <InputGroupAddon align={inlineComposer ? "inline-end" : "block-end"}>
-            {!inlineComposer && <span className="text-muted-foreground text-xs">{translate("chatUI.noTools")}</span>}
+            {!inlineComposer && <span className="text-muted-foreground text-xs">{t("Standalone Q&A · No tool execution")}</span>}
             {side.running ? (
               <InputGroupButton
                 className="ml-auto"
                 variant="destructive"
                 size="icon-xs"
                 onClick={() => void side.stop()}
-                aria-label={translate("chatUI.stopSide")}
+                aria-label={t("Stop the side answer")}
               >
                 <SquareIcon />
               </InputGroupButton>
@@ -231,48 +202,30 @@ function SidePanel({
                 size="icon-xs"
                 onClick={() => void side.ask(side.draft)}
                 disabled={side.busy || !side.draft.trim() || !side.snapshot?.available}
-                aria-label={translate("chatUI.sendSide")}
+                aria-label={t("Send side question")}
               >
                 <ArrowUpIcon />
               </InputGroupButton>
             )}
           </InputGroupAddon>
         </InputGroup>
-        {suggestions?.length ? (
-          <fieldset className="mt-2 flex flex-wrap gap-1.5" aria-label={translate("chatUI.suggestions")}>
-            {suggestions.map((suggestion) => {
-              const { label, question } =
-                typeof suggestion === "string" ? { label: suggestion, question: suggestion } : suggestion;
-              return (
-                <Button
-                  key={question}
-                  variant="outline"
-                  size="sm"
-                  className="h-auto whitespace-normal text-left text-xs"
-                  disabled={side.busy || !side.snapshot?.available}
-                  onClick={() => void side.ask(question)}
-                >
-                  {label}
-                </Button>
-              );
-            })}
-          </fieldset>
-        ) : null}
       </div>
       {inlineComposer && (
-        <div className="shrink-0 truncate px-3 pt-0.5 pb-1 text-muted-foreground text-xs">
-          {translate("chatUI.noTools")}
-        </div>
+        <div className="shrink-0 truncate px-3 pt-0.5 pb-1 text-muted-foreground text-xs">{t("Standalone Q&A · No tool execution")}</div>
       )}
       <AlertDialog open={confirm} onOpenChange={setConfirm}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{translate("chatUI.clearTitle")}</AlertDialogTitle>
-            <AlertDialogDescription>{translate("chatUI.clearDescription")}</AlertDialogDescription>
+            <AlertDialogTitle>{t("Clear side-question history?")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                "Deletes this agent's side Q&A and stops any answer still being generated. The main session and context snapshot are kept.",
+              )}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{translate("chatUI.cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void side.clear()}>{translate("chatUI.clearHistory")}</AlertDialogAction>
+            <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void side.clear()}>{t("Clear history")}</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -284,90 +237,36 @@ export function SideQuestionWorkspace({
   side,
   label,
   children,
-  mode = "split",
   composerLayout = "stacked",
-  suggestions,
-  placeholder,
-  noSnapshotHint,
-  emptyDescription,
-  className,
-  mainClassName,
 }: {
   side: SideQuestions;
   label: string;
   children: ReactNode;
-  mode?: "split" | "floating";
   composerLayout?: ComposerLayout;
-  suggestions?: SuggestedQuestion[];
-  placeholder?: string;
-  noSnapshotHint?: string;
-  emptyDescription?: string;
-  className?: string;
-  mainClassName?: string;
 }) {
-  const { t: translate } = useLiveTranslation();
   const mobile = useIsMobile();
-  const desktopSideOpen = side.open && side.enabled && !mobile;
-  const floatingSideOpen = desktopSideOpen && mode === "floating";
   return (
     <>
-      {floatingSideOpen ? (
-        <>
-          <div className={cn("min-h-0 min-w-0 flex-1", className, mainClassName)}>{children}</div>
-          <div className="pointer-events-none fixed inset-x-0 top-20 z-40 flex justify-end px-4 pb-4 sm:px-6">
-            <div className="pointer-events-auto h-[calc(100svh-6rem)] w-[min(420px,calc(100vw-2rem))] overflow-hidden rounded-xl border bg-background shadow-2xl">
-              <SidePanel
-                side={side}
-                label={label}
-                composerLayout={composerLayout}
-                suggestions={suggestions}
-                placeholder={placeholder}
-                noSnapshotHint={noSnapshotHint}
-                emptyDescription={emptyDescription}
-              />
-            </div>
-          </div>
-        </>
-      ) : desktopSideOpen ? (
-        <ResizablePanelGroup orientation="horizontal" className={cn("min-h-0 min-w-0 flex-1", className)}>
-          <ResizablePanel
-            id="main-conversation"
-            minSize="35%"
-            className={cn("flex min-h-0 min-w-0 flex-col", mainClassName)}
-          >
-            {children}
-          </ResizablePanel>
-          <ResizableHandle withHandle />
-          <ResizablePanel id="side-question" defaultSize="38%" minSize="280px" maxSize="65%">
-            <SidePanel
-              side={side}
-              label={label}
-              composerLayout={composerLayout}
-              suggestions={suggestions}
-              placeholder={placeholder}
-              noSnapshotHint={noSnapshotHint}
-              emptyDescription={emptyDescription}
-            />
-          </ResizablePanel>
-        </ResizablePanelGroup>
-      ) : (
-        <div className={cn("flex min-h-0 w-full min-w-0 flex-1 flex-col", className, mainClassName)}>{children}</div>
-      )}
+      <ResizablePanelGroup orientation="horizontal" className="min-h-0 min-w-0 flex-1">
+        <ResizablePanel id="main-conversation" minSize="35%" className="flex min-h-0 min-w-0 flex-col">
+          {children}
+        </ResizablePanel>
+        {side.open && side.enabled && !mobile && (
+          <>
+            <ResizableHandle withHandle />
+            <ResizablePanel id="side-question" defaultSize="38%" minSize="280px" maxSize="65%">
+              <SidePanel side={side} label={label} composerLayout={composerLayout} />
+            </ResizablePanel>
+          </>
+        )}
+      </ResizablePanelGroup>
       <Drawer open={mobile && side.open && side.enabled} onOpenChange={side.setOpen}>
         <DrawerContent className="h-[85svh]">
           <DrawerHeader className="sr-only">
-            <DrawerTitle>{translate("chatUI.sideQuestion")}</DrawerTitle>
-            <DrawerDescription>{translate("chatUI.drawerDescription", { label })}</DrawerDescription>
+            <DrawerTitle>{t("Side question")}</DrawerTitle>
+            <DrawerDescription>{t("Standalone Q&A for {label}", { label })}</DrawerDescription>
           </DrawerHeader>
-          <SidePanel
-            side={side}
-            label={label}
-            composerLayout={composerLayout}
-            suggestions={suggestions}
-            placeholder={placeholder}
-            noSnapshotHint={noSnapshotHint}
-            emptyDescription={emptyDescription}
-          />
+          <SidePanel side={side} label={label} composerLayout={composerLayout} />
         </DrawerContent>
       </Drawer>
     </>

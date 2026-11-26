@@ -11,17 +11,15 @@ import (
 	"github.com/google/uuid"
 )
 
-var ErrSideBusy = errors.New("当前会话已有旁路问题正在回答")
-var ErrSideParentGone = errors.New("旁路父会话已删除或归档")
+var ErrSideBusy = errors.New("the current session already has a side question being answered")
+var ErrSideParentGone = errors.New("the side question's parent session has been deleted or archived")
 
 // Lock the real parent before the side session, also covering soft task/intent
 // deletion. A delayed checkpoint cannot recreate data after archive cleanup.
 func lockSideParent(ctx context.Context, tx *sql.Tx, p sidequestion.Parent) error {
 	var id int64
 	var err error
-	if p.ApprovalID > 0 {
-		err = tx.QueryRowContext(ctx, `SELECT id FROM intercept_pending WHERE id=$1 FOR SHARE`, p.ApprovalID).Scan(&id)
-	} else if p.ConversationID > 0 {
+	if p.ConversationID > 0 {
 		err = tx.QueryRowContext(ctx, `SELECT id FROM conversations WHERE id=$1 FOR SHARE`, p.ConversationID).Scan(&id)
 	} else {
 		err = tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE id=$1 AND exploration_id=$2 AND deleted_at IS NULL AND archived_at IS NULL FOR SHARE`, p.TaskID, p.ExplorationID).Scan(&id)
@@ -55,10 +53,10 @@ func (d *DB) SaveSideSnapshot(ctx context.Context, s sidequestion.Snapshot) erro
 	if err = lockSideParent(ctx, tx, s.Parent); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO side_question_sessions(session_key,conversation_id,task_id,exploration_id,intent_id,approval_id,run_id,version,snapshot)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(session_key) DO UPDATE SET run_id=EXCLUDED.run_id,version=EXCLUDED.version,snapshot=EXCLUDED.snapshot
+	_, err = tx.ExecContext(ctx, `INSERT INTO side_question_sessions(session_key,conversation_id,task_id,exploration_id,intent_id,run_id,version,snapshot)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(session_key) DO UPDATE SET run_id=EXCLUDED.run_id,version=EXCLUDED.version,snapshot=EXCLUDED.snapshot
 WHERE (side_question_sessions.run_id,side_question_sessions.version)<(EXCLUDED.run_id,EXCLUDED.version)`,
-		s.Parent.Key(), nullableSideID(s.Parent.ConversationID), nullableSideID(s.Parent.TaskID), nullableSideID(s.Parent.ExplorationID), nullableSideID(s.Parent.IntentID), nullableSideID(s.Parent.ApprovalID), s.RunID, s.Version, string(jsonbClean(b)))
+		s.Parent.Key(), nullableSideID(s.Parent.ConversationID), nullableSideID(s.Parent.TaskID), nullableSideID(s.Parent.ExplorationID), nullableSideID(s.Parent.IntentID), s.RunID, s.Version, string(jsonbClean(b)))
 	if err != nil {
 		return err
 	}
@@ -175,7 +173,7 @@ func (d *DB) StartSideRequest(ctx context.Context, s sidequestion.Snapshot, clie
 	e, err := scanSide(tx.QueryRowContext(ctx, `SELECT `+sideCols+` FROM side_question_requests WHERE session_key=$1 AND generation=$2 AND client_id=$3`, s.Parent.Key(), generation, clientID))
 	if err == nil {
 		if e.Question != question {
-			return nil, false, fmt.Errorf("同一请求 ID 不能用于不同问题")
+			return nil, false, fmt.Errorf("the same request ID cannot be used for different questions")
 		}
 		return &e, false, tx.Commit()
 	}
@@ -285,6 +283,6 @@ AND EXISTS(SELECT 1 FROM side_question_requests r WHERE r.id=$4 AND r.session_ke
 }
 
 func (d *DB) InterruptSideRequests(ctx context.Context) error {
-	_, err := d.ExecContext(ctx, `UPDATE side_question_requests SET status='interrupted',error='服务重启，回答已中断',sequence=sequence+1 WHERE status='running'`)
+	_, err := d.ExecContext(ctx, `UPDATE side_question_requests SET status='interrupted',error='service restarted; the answer was interrupted',sequence=sequence+1 WHERE status='running'`)
 	return err
 }

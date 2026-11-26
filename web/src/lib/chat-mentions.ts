@@ -1,13 +1,13 @@
 export const mentionKinds = [
-  { kind: "finding", label: "漏洞", alias: "finding", english: "Finding" },
-  { kind: "asset", label: "资产", alias: "asset", english: "Asset" },
-  { kind: "company", label: "企业", alias: "company", english: "Company" },
-  { kind: "endpoint", label: "接口", alias: "api", english: "Endpoint" },
-  { kind: "ip", label: "IP", alias: "ip", english: "IP" },
-  { kind: "app", label: "应用", alias: "app", english: "Application" },
-  { kind: "root_domain", label: "域名", alias: "domain", english: "Root domain" },
-  { kind: "subdomain", label: "子域名", alias: "subdomain", english: "Subdomain" },
-  { kind: "service", label: "服务", alias: "service", english: "Service" },
+  { kind: "finding", label: "finding", alias: "finding" },
+  { kind: "asset", label: "asset", alias: "asset" },
+  { kind: "company", label: "company", alias: "company" },
+  { kind: "endpoint", label: "endpoint", alias: "api" },
+  { kind: "ip", label: "IP", alias: "ip" },
+  { kind: "app", label: "app", alias: "app" },
+  { kind: "root_domain", label: "domain", alias: "domain" },
+  { kind: "subdomain", label: "subdomain", alias: "subdomain" },
+  { kind: "service", label: "service", alias: "service" },
 ] as const;
 
 export type MentionKind = (typeof mentionKinds)[number]["kind"];
@@ -29,49 +29,34 @@ export function activeMention(value: string, caret: number) {
 
 export function mentionSearch(query: string) {
   const text = query.trimStart().toLowerCase();
-  const aliases = mentionKinds
-    .flatMap((item) =>
-      [...new Set([item.label.toLowerCase(), item.alias, item.kind, item.english.toLowerCase()])].map((alias) => ({
-        item,
-        alias,
-      })),
-    )
-    .sort((a, b) => b.alias.length - a.alias.length);
-  for (const { item, alias } of aliases) {
-    if (text === alias || text.startsWith(`${alias} `) || (/[^a-z_ ]/.test(alias) && text.startsWith(alias))) {
-      return { kind: item.kind, query: query.trimStart().slice(alias.length).trim(), categories: [] };
+  for (const item of mentionKinds) {
+    for (const alias of [item.label.toLowerCase(), item.alias]) {
+      if (text === alias || text.startsWith(`${alias} `) || (/[^a-z]/.test(alias) && text.startsWith(alias))) {
+        return { kind: item.kind, query: query.trimStart().slice(alias.length).trim(), categories: [] };
+      }
     }
   }
-  const categories = mentionKinds.filter((item) =>
-    [item.label.toLowerCase(), item.alias, item.kind, item.english.toLowerCase()].some((alias) =>
-      alias.startsWith(text),
-    ),
+  const categories = mentionKinds.filter(
+    (item) => item.label.toLowerCase().startsWith(text) || item.alias.startsWith(text),
   );
   return { kind: "" as const, query: query.trim(), categories };
 }
 
 export function mentionToken(item: ChatMention) {
+  const kind = mentionKinds.find((entry) => entry.kind === item.kind)?.label ?? "asset";
   const label = item.label
-    .replace(/[[\]]/g, (char) => (char === "[" ? "（" : "）"))
+    .replace(/[[\]]/g, (char) => (char === "[" ? "(" : ")"))
     .replace(/\s+/g, " ")
     .slice(0, 100);
-  // Stored message syntax is independent of the selected display language.
-  return `@[${item.kind}#${item.id} ${label}]`;
+  return `@[${kind}#${item.id} ${label}]`;
 }
 
-export function selectedMentions(value: string, translate?: (key: string) => string) {
-  // Keep recognizing Chinese tokens in saved drafts and conversation history.
-  return [
-    ...value.matchAll(
-      /@\[(finding|asset|company|endpoint|ip|app|root_domain|subdomain|service|漏洞|资产|企业|接口|IP|应用|域名|子域名|服务)#([0-9]+)(?: ([^\]\r\n]*))?\]/g,
-    ),
-  ].map((match) => {
-    const entry = mentionKinds.find((item) => item.kind === match[1] || item.label === match[1]);
-    const label = translate ? translate(`mention.${entry?.kind ?? "asset"}`) : (entry?.label ?? match[1]);
-    return {
+export function selectedMentions(value: string) {
+  return [...value.matchAll(/@\[(finding|asset|company|endpoint|IP|app|domain|subdomain|service)#([0-9]+)(?: ([^\]\r\n]*))?\]/g)].map(
+    (match) => ({
       token: match[0],
-      label: `${label} #${match[2]}${match[3] ? ` · ${match[3]}` : ""}`,
+      label: `${match[1]} #${match[2]}${match[3] ? ` · ${match[3]}` : ""}`,
       start: match.index,
-    };
-  });
+    }),
+  );
 }

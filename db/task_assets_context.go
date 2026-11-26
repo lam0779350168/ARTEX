@@ -21,25 +21,7 @@ context_tasks AS (
   WHERE relation.task_id=$1
 )`
 
-// taskAssetVisibilityCTE reads the policy on every query. Explicit source tasks
-// contribute their own assets, never their global-sharing setting.
-const taskAssetVisibilityCTE = `,
-visible_assets AS (
-  SELECT a.id FROM assets a
-  WHERE EXISTS (
-    SELECT 1 FROM tasks current
-    WHERE current.id=$1 AND current.deleted_at IS NULL AND current.share_global_assets
-  )
-  OR EXISTS (SELECT 1 FROM context_tasks ctx WHERE ctx.task_id=ANY(a.task_ids))
-  OR EXISTS (
-    SELECT 1 FROM exploration_anchors anchor
-    JOIN exploration_nodes node ON node.id=anchor.node_id
-    JOIN context_tasks ctx ON ctx.exploration_id=node.exploration_id
-    WHERE anchor.asset_id=a.id
-  )
-)`
-
-const contextCoverageCTE = directTaskContextCTE + taskAssetVisibilityCTE + `,
+const contextCoverageCTE = directTaskContextCTE + `,
 target AS (
   SELECT DISTINCT a.id, a.type,
          COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
@@ -55,16 +37,13 @@ target AS (
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
-  WHERE a.id IN (SELECT id FROM visible_assets)
-    UNION
-    SELECT a.id,a.type,COALESCE(a.url,a.domain,a.ip,a.app_name,a.root_domain,'') AS label
-    FROM assets a WHERE EXISTS (SELECT 1 FROM context_tasks ctx WHERE ctx.task_id=ANY(a.task_ids))
+  WHERE ` + declaredScopeFilter + `
 	UNION
 	SELECT a.id, a.type,
 	       COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
 	FROM assets a
 	JOIN exploration_anchors ea ON ea.asset_id=a.id
-	JOIN exploration_nodes en ON en.id=ea.node_id
+	JOIN exploration_nodes en ON en.id=ea.node_id AND en.kind='fact'
 	JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
 ),
 tested AS (
@@ -74,11 +53,41 @@ tested AS (
   JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
 )`
 
-// scopeTargetCTE applies the live visibility policy to DSL and ID reads.
-// An isolated task sees only its own and explicitly related tasks' assets.
-const scopeTargetCTE = directTaskContextCTE + taskAssetVisibilityCTE + `,
-target AS (SELECT id FROM visible_assets)
-`
+// scopeTargetCTE selects every asset that BELONGS to the current task's (and its
+// direct source tasks') declared scope — membership, not literal value: a
+// root_domain scope pulls in every subdomain / service / endpoint whose own
+// root_domain column equals it; an ip/cidr scope pulls in assets whose ip OR
+// IP-literal host falls inside the net. $1 is the task id. Unlike contextCoverageCTE
+// it carries neither the fact-anchor union nor the tested set — it is pure "in
+// declared scope", independent of what has already been touched. Used by the
+// agent's list_assets so a query returns the task's relevant assets, not the
+// whole shared store.
+const scopeTargetCTE = `
+context_tasks AS (
+  SELECT t.id AS task_id
+  FROM tasks t
+  WHERE t.id=$1 AND t.deleted_at IS NULL
+  UNION ALL
+  SELECT source.id
+  FROM task_relations relation
+  JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
+  WHERE relation.task_id=$1
+),
+target AS (
+  SELECT DISTINCT a.id
+  FROM assets a
+  JOIN task_scope ts ON (
+       (ts.kind='company'     AND a.company_id = ts.company_id)
+    OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
+    OR (ts.kind='subdomain'   AND a.domain = ts.domain)
+    OR (ts.kind IN ('ip','cidr') AND (ts.net >>= try_inet(a.ip) OR ts.net >>= try_inet(a.domain)))
+    OR (ts.kind='icp' AND (
+         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
+         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
+       ))
+  )
+  JOIN context_tasks ctx ON ctx.task_id=ts.task_id
+)`
 
 // ListTaskScopeWithSources returns the current task's scope followed by the
 // scopes of its direct source tasks. TaskScope.TaskID preserves provenance.
@@ -110,8 +119,10 @@ ORDER BY CASE WHEN ts.task_id=$1 THEN 0 ELSE 1 END, ts.id`, taskID)
 }
 
 // TaskCoverageWithSources computes one coverage view over the union of the
-// current task and its direct sources: source scopes and anchored assets extend
-// the denominator, while fact anchors count as tested. No row is copied.
+// current task and its direct sources: source scopes and fact-anchored assets
+// extend the denominator, while fact anchors count as tested. Auto scope rows
+// count only under a declared domain or IP root (declaredScopeFilter), and an intent anchor
+// alone (insert_assets, asset_ids) no longer adds an asset. No row is copied.
 func (s *AssetStore) TaskCoverageWithSources(taskID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`WITH `+directTaskContextCTE+`
@@ -191,7 +202,7 @@ ORDER BY target.id LIMIT $`+limitPosition+` OFFSET $`+offsetPosition, pageArgs..
 // used for destructive task cleanup; HostsByTask intentionally retains that
 // narrower, task-owned behavior.
 func (s *AssetStore) HostsByTaskWithSources(taskID int64) ([]string, error) {
-	rows, err := s.db.Query(`WITH `+directTaskContextCTE+taskAssetVisibilityCTE+`,
+	rows, err := s.db.Query(`WITH `+directTaskContextCTE+`,
 context_assets AS (
   SELECT DISTINCT a.id
   FROM assets a
@@ -215,13 +226,13 @@ context_assets AS (
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
-  WHERE a.id IN (SELECT id FROM visible_assets)
 )
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,'')
 FROM assets a JOIN context_assets ctx ON ctx.id=a.id`, taskID)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	hosts := map[string]struct{}{}
 	add := func(host string) {
 		host = strings.TrimSpace(strings.ToLower(host))
@@ -242,55 +253,6 @@ FROM assets a JOIN context_assets ctx ON ctx.id=a.id`, taskID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	// A task may be scoped to domains before the asset graph has materialized
-	// every matching subdomain/service row. Include the declared scope values so
-	// task HTTP history still sees the real recorded traffic. Root domains use a
-	// wildcard marker understood by traffic.Page and therefore include subdomains.
-	scopes, err := s.ListTaskScopeWithSources(taskID)
-	if err != nil {
-		return nil, err
-	}
-	rootDomains := map[string]bool{}
-	for _, scope := range scopes {
-		domain := strings.TrimSpace(strings.ToLower(scope.Domain))
-		switch scope.Kind {
-		case "root_domain":
-			if domain != "" {
-				add(domain)
-				rootDomains[domain] = false
-			}
-		case "subdomain":
-			if domain != "" {
-				add(domain)
-			}
-		case "ip", "cidr":
-			add(strings.TrimSpace(strings.ToLower(scope.Value)))
-			network := strings.TrimSpace(strings.ToLower(scope.Net))
-			add(network)
-			if slash := strings.IndexByte(network, '/'); slash > 0 {
-				add(network[:slash])
-			}
-		}
-	}
-	for _, scope := range scopes {
-		if scope.Kind != "subdomain" {
-			continue
-		}
-		domain := strings.TrimSpace(strings.ToLower(scope.Domain))
-		for root := range rootDomains {
-			if domain == root || strings.HasSuffix(domain, "."+root) {
-				rootDomains[root] = true
-			}
-		}
-	}
-	for root, hasChildren := range rootDomains {
-		if !hasChildren {
-			add("*." + root)
-		}
 	}
 	out := make([]string, 0, len(hosts))
 	for host := range hosts {

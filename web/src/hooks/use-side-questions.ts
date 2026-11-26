@@ -4,10 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toast } from "sonner";
 
-import { openSSE } from "@/lib/api";
+import { t } from "@/i18n";
+import { sseUrl } from "@/lib/api";
 import { isBtwCommand, type SideExchange, type SideHistory, sideAPI } from "@/lib/side-questions";
+import { setVisibleInterval } from "@/lib/polling";
 
-// crypto.randomUUID 仅在安全上下文可用(https/localhost);经 IP+http 访问时降级。
+// crypto.randomUUID is only available in secure contexts (https/localhost); it degrades when accessed via IP+http.
 function newSideRequestID(): string {
   return (
     globalThis.crypto?.randomUUID?.() ?? `btw-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
@@ -28,7 +30,6 @@ export function useSideQuestions(parent: string | null) {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<SideExchange[]>([]);
   const [snapshot, setSnapshot] = useState<SideHistory["snapshot"]>(null);
-  const [snapshotError, setSnapshotError] = useState("");
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -65,7 +66,6 @@ export function useSideQuestions(parent: string | null) {
         setItems((old) => merge(old, data.items));
         restoreFailedDraft(data.items);
         setSnapshot(data.snapshot);
-        setSnapshotError(data.snapshot_error ?? "");
         setLoadError("");
         if (before || !cursor.current) {
           cursor.current = data.next_cursor;
@@ -83,7 +83,6 @@ export function useSideQuestions(parent: string | null) {
     setStateParent(parent);
     setItems([]);
     setSnapshot(null);
-    setSnapshotError("");
     setNextCursor(0);
     setDraft("");
     setError("");
@@ -106,7 +105,6 @@ export function useSideQuestions(parent: string | null) {
         if (version !== epoch.current) return;
         setItems((old) => merge(old, data.items));
         setSnapshot(data.snapshot);
-        setSnapshotError(data.snapshot_error ?? "");
         setNextCursor(data.next_cursor);
         cursor.current = data.next_cursor;
       })
@@ -124,15 +122,15 @@ export function useSideQuestions(parent: string | null) {
   useEffect(() => {
     if (!open || !parent) return;
     void load();
-    const timer = setInterval(() => void load(), 2000);
-    return () => clearInterval(timer);
+    const stopPolling = setVisibleInterval(() => void load(), 2000);
+    return stopPolling;
   }, [open, parent, load]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: Reconnect after a clear attempt invalidates older callbacks.
   useEffect(() => {
     if (!runningID) return;
     const version = epoch.current;
-    const stream = openSSE(`/api/side-questions/${runningID}/events`);
+    const stream = new EventSource(sseUrl(`/api/side-questions/${runningID}/events`));
     stream.addEventListener("snapshot", (event) => {
       if (version !== epoch.current) return;
       try {
@@ -142,7 +140,7 @@ export function useSideQuestions(parent: string | null) {
         restoreFailedDraft([item]);
         if (item.status !== "running") stream.close();
       } catch {
-        setError("chatUI.sideParseFailed");
+        setError(t("Failed to parse side-question data; please reopen the panel"));
       }
     });
     stream.addEventListener("cleared", () => {
@@ -235,7 +233,6 @@ export function useSideQuestions(parent: string | null) {
     setOpen,
     items: current ? items : [],
     snapshot: current ? snapshot : null,
-    snapshotError: current ? snapshotError : "",
     draft: current ? draft : "",
     setDraft,
     busy: current && busy,

@@ -11,7 +11,7 @@ import (
 )
 
 // =====================================================================
-// 公司主体层
+// Company entity layer
 // =====================================================================
 
 // Company is a row in the companies table.
@@ -52,8 +52,10 @@ var (
 )
 
 const (
-	// 企业范围不限制规则条数:逐个 IP / 域名录入的范围动辄上千条,封顶只会逼用户
-	// 拆成多个企业。请求体大小(server 侧 maxCompanyMutationBodyBytes)仍然兜底。
+	// Company scope is not capped by rule count: scopes entered one IP / domain at
+	// a time easily run into the thousands, and a cap would just force users to
+	// split them across multiple companies. The request body size
+	// (server-side maxCompanyMutationBodyBytes) remains the backstop.
 	//
 	// Raw and normalized textual scope payloads are bounded by Unicode rune
 	// count so multi-byte input is treated consistently by the API and DB layer.
@@ -69,12 +71,12 @@ func (e *CompanyScopeValidationError) Error() string { return e.Message }
 
 // ValidateCompanyScopeInputBounds applies request-wide limits before parsing.
 // Store methods call it again so non-HTTP callers cannot bypass the limits.
-// 只约束单条规则的长度,不限制条数。
+// Only the length of a single rule is constrained; the number of rules is not.
 func ValidateCompanyScopeInputBounds(inputs []ScopeInput) error {
 	for i, input := range inputs {
 		if utf8.RuneCountInString(input.Value) > MaxCompanyScopeRawRunes {
 			return &CompanyScopeValidationError{Message: fmt.Sprintf(
-				"企业范围第 %d 条原始值过长: 最多 %d 个字符", i+1, MaxCompanyScopeRawRunes,
+				"company scope rule #%d raw value is too long: at most %d characters", i+1, MaxCompanyScopeRawRunes,
 			)}
 		}
 	}
@@ -293,55 +295,6 @@ ORDER BY c.name`)
 	return out, nil
 }
 
-// ListCompaniesForTask exposes only task-visible ownership and explicitly
-// associated companies. Isolated tasks never receive unrelated company scopes.
-func (s *CompanyStore) ListCompaniesForTask(taskID int64) ([]*CompanyWithScope, error) {
-	if taskID <= 0 {
-		return s.ListCompanies()
-	}
-	var shared bool
-	if err := s.db.QueryRow(`SELECT share_global_assets FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&shared); err != nil {
-		return nil, err
-	}
-	if shared {
-		return s.ListCompanies()
-	}
-	rows, err := s.db.Query(`WITH `+directTaskContextCTE+taskAssetVisibilityCTE+`
- SELECT c.id,c.name,c.nkey,c.logo,c.created_at::text,c.updated_at::text,COUNT(a.id),
- EXISTS(SELECT 1 FROM task_scope ts JOIN context_tasks ctx ON ctx.task_id=ts.task_id WHERE ts.company_id=c.id AND ts.kind='company')
- FROM companies c LEFT JOIN assets a ON a.company_id=c.id AND a.id IN (SELECT id FROM visible_assets)
- WHERE a.id IS NOT NULL OR EXISTS(SELECT 1 FROM task_scope ts JOIN context_tasks ctx ON ctx.task_id=ts.task_id WHERE ts.company_id=c.id AND ts.kind='company')
- GROUP BY c.id ORDER BY c.name`, taskID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []*CompanyWithScope{}
-	associated := map[int64]bool{}
-	for rows.Next() {
-		c := &CompanyWithScope{Scope: []ScopeRule{}}
-		var explicit bool
-		if err := rows.Scan(&c.ID, &c.Name, &c.NKey, &c.Logo, &c.CreatedAt, &c.UpdatedAt, &c.AssetCount, &explicit); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-		associated[c.ID] = explicit
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	// Only explicit company associations grant access to the company's scope.
-	for _, c := range out {
-		if associated[c.ID] {
-			c.Scope, err = s.GetScope(c.ID)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	return out, nil
-}
-
 // GetScope returns all scope rules for a company.
 func (s *CompanyStore) GetScope(companyID int64) ([]ScopeRule, error) {
 	rows, err := s.db.Query(`
@@ -421,7 +374,7 @@ func (s *CompanyStore) AddScopeInputsChecked(companyID int64, inputs []ScopeInpu
 	if needsAttribution {
 		warning, err := recomputeAttributionTx(tx)
 		if err != nil {
-			return 0, 0, invalid, errors, fmt.Errorf("重新计算企业归属失败: %w", err)
+			return 0, 0, invalid, errors, fmt.Errorf("failed to recompute company attribution: %w", err)
 		}
 		logAttributionWarning(warning)
 	}
@@ -449,12 +402,12 @@ func validateParsedScopeBounds(rules []ParsedScope) error {
 	for i, rule := range rules {
 		if utf8.RuneCountInString(rule.Raw) > MaxCompanyScopeRawRunes {
 			return &CompanyScopeValidationError{Message: fmt.Sprintf(
-				"企业范围第 %d 条原始值过长: 最多 %d 个字符", i+1, MaxCompanyScopeRawRunes,
+				"company scope rule #%d raw value is too long: at most %d characters", i+1, MaxCompanyScopeRawRunes,
 			)}
 		}
 		if utf8.RuneCountInString(rule.Value) > MaxCompanyScopeValueRunes {
 			return &CompanyScopeValidationError{Message: fmt.Sprintf(
-				"企业范围第 %d 条规范化值过长: 最多 %d 个字符", i+1, MaxCompanyScopeValueRunes,
+				"company scope rule #%d normalized value is too long: at most %d characters", i+1, MaxCompanyScopeValueRunes,
 			)}
 		}
 	}
@@ -680,14 +633,20 @@ LIMIT $1`, malformedIPAssetsSampled)
 	if total == 0 {
 		return "", nil
 	}
+	return malformedIPAssetWarningText(total, samples), nil
+}
+
+// malformedIPAssetWarningText words the warning for total offending assets, of
+// which only samples are named; the ones left out are counted in the suffix.
+func malformedIPAssetWarningText(total int, samples []string) string {
 	warning := fmt.Sprintf(
-		"%d 条资产的 ip 字段不是合法 IP，已跳过 IP/CIDR 范围匹配（这些资产不会被网段规则归属到企业）：%s",
-		total, strings.Join(samples, "、"),
+		"%d assets have an ip field that is not a valid IP; skipped for IP/CIDR scope matching (these assets will not be attributed to a company by subnet rules): %s",
+		total, strings.Join(samples, ", "),
 	)
 	if total > len(samples) {
-		warning += fmt.Sprintf(" 等 %d 条", total)
+		warning += fmt.Sprintf(" and %d more", total-len(samples))
 	}
-	return warning, nil
+	return warning
 }
 
 // UpdateScope replaces all scope rules for a company and reattributes.
@@ -719,7 +678,7 @@ func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeI
 	rules, invalid, errs := parseScopeInputs(inputs)
 	if invalid > 0 {
 		return 0, invalid, errs, &CompanyScopeValidationError{Message: fmt.Sprintf(
-			"企业范围包含 %d 条无效规则，未覆盖原有范围", invalid,
+			"company scope contains %d invalid rules; the existing scope was not overwritten", invalid,
 		)}
 	}
 	if err := validateParsedScopeBounds(rules); err != nil {
@@ -747,7 +706,7 @@ func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeI
 	// detach scope-derived assets or expose a lower-precedence company match.
 	warning, err := recomputeAttributionTx(tx)
 	if err != nil {
-		return 0, invalid, errs, fmt.Errorf("重新计算企业归属失败: %w", err)
+		return 0, invalid, errs, fmt.Errorf("failed to recompute company attribution: %w", err)
 	}
 	logAttributionWarning(warning)
 	if err := tx.Commit(); err != nil {

@@ -1,11 +1,10 @@
 "use client"
 
-import { useTranslation } from "react-i18next";
-
 import * as React from "react"
 import { Command as CommandPrimitive } from "cmdk"
 
 import { cn } from "@/lib/utils"
+import { t } from "@/i18n"
 import {
   Dialog,
   DialogContent,
@@ -36,8 +35,8 @@ function Command({
 }
 
 function CommandDialog({
-  title,
-  description,
+  title = t("Command Palette"),
+  description = t("Search for a command to run..."),
   children,
   className,
   showCloseButton = false,
@@ -48,12 +47,11 @@ function CommandDialog({
   className?: string
   showCloseButton?: boolean
 }) {
-  const { t } = useTranslation();
   return (
     <Dialog {...props}>
       <DialogHeader className="sr-only">
-        <DialogTitle>{title ?? t("ui.commandTitle")}</DialogTitle>
-        <DialogDescription>{description ?? t("ui.commandDescription")}</DialogDescription>
+        <DialogTitle>{title}</DialogTitle>
+        <DialogDescription>{description}</DialogDescription>
       </DialogHeader>
       <DialogContent
         className={cn(

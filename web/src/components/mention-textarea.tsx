@@ -3,14 +3,21 @@
 import * as React from "react";
 
 import { AtSignIcon, ChevronRightIcon, Loader2Icon, XIcon } from "lucide-react";
-import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { InputGroupTextarea } from "@/components/ui/input-group";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import { activeMention, type ChatMention, mentionSearch, mentionToken, selectedMentions } from "@/lib/chat-mentions";
+import {
+  activeMention,
+  type ChatMention,
+  mentionKinds,
+  mentionSearch,
+  mentionToken,
+  selectedMentions,
+} from "@/lib/chat-mentions";
+import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 type Props = Omit<React.ComponentProps<"textarea">, "value" | "onChange" | "ref"> & {
@@ -20,7 +27,6 @@ type Props = Omit<React.ComponentProps<"textarea">, "value" | "onChange" | "ref"
 };
 
 export function MentionTextarea({ value, onValueChange, onKeyDown, className, inputGroup, disabled, ...props }: Props) {
-  const { t } = useTranslation();
   const textarea = React.useRef<HTMLTextAreaElement>(null);
   const composing = React.useRef(false);
   const pendingKeyboardIndex = React.useRef<number | null>(null);
@@ -49,7 +55,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
   const loadingMore = result?.key === requestKey && result.loadingMore;
   const pageError = result?.key === requestKey ? result.pageError : undefined;
   const count = categories.length || items.length;
-  const selected = selectedMentions(value, t);
+  const selected = selectedMentions(value);
 
   React.useEffect(() => {
     if (!requestKey) return;
@@ -140,7 +146,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
   }
 
   function choose(index: number) {
-    if (categories[index]) replaceActive(`@${categories[index].alias} `, false);
+    if (categories[index]) replaceActive(`@${categories[index].label} `, false);
     else if (items[index]) replaceActive(`${mentionToken(items[index])} `, true);
   }
 
@@ -193,7 +199,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               value={value}
               disabled={disabled}
               className={className}
-              aria-label={props["aria-label"] ?? t("mention.messageLabel")}
+              aria-label={props["aria-label"] ?? t("Message, type @ to reference records")}
               aria-autocomplete="list"
               aria-controls={open ? listId : undefined}
               aria-expanded={open}
@@ -225,22 +231,22 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
           onInteractOutside={(event) => {
             if (event.target === textarea.current) event.preventDefault();
           }}
-          aria-label={t("mention.chooseRecord")}
+          aria-label={t("Choose a reference record")}
         >
           <div className="flex items-center justify-between px-2 py-1 text-muted-foreground text-xs">
             <span>
               {categories.length
-                ? t("mention.chooseType")
-                : t("mention.searchType", {
-                    kind: search.kind ? t(`mention.${search.kind}`) : t("mention.allRecords"),
+                ? t("Choose a reference type")
+                : t("Search {kind}", {
+                    kind: mentionKinds.find((kind) => kind.kind === search.kind)?.label ?? t("all records"),
                   })}
             </span>
-            <span>{t("mention.keyboard")}</span>
+            <span>{t("↑↓ Select · Enter Confirm · Esc Close")}</span>
           </div>
           <div
             id={listId}
             role="listbox"
-            aria-label={t("mention.candidates")}
+            aria-label={t("Reference candidates")}
             className="max-h-60 overflow-y-auto"
             onScroll={(event) => {
               const list = event.currentTarget;
@@ -262,24 +268,24 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
                 onClick={() => choose(index)}
               >
                 <AtSignIcon className="size-4 text-muted-foreground" />
-                <span>{t(`mention.${kind.kind}`)}</span>
+                <span>{kind.label}</span>
                 <ChevronRightIcon className="ml-auto size-4 text-muted-foreground" />
               </button>
             ))}
             {!categories.length && loading && (
               <div role="status" className="flex items-center gap-2 p-3 text-muted-foreground text-sm">
                 <Loader2Icon className="size-4 animate-spin" />
-                {t("mention.searching")}
+                {t("Searching…")}
               </div>
             )}
             {!categories.length && !loading && error && (
               <div role="alert" className="p-3 text-destructive text-sm">
-                {t("mention.searchFailed", { error })}
+                {t("Search failed: {error}. Please retype and try again.", { error })}
               </div>
             )}
             {!categories.length && !loading && !error && !items.length && (
               <div role="status" className="p-3 text-muted-foreground text-sm">
-                {t("mention.empty")}
+                {t("No matching records; try a different name, address, or ID")}
               </div>
             )}
             {items.map((item, index) => (
@@ -297,7 +303,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
                 onClick={() => choose(index)}
               >
                 <span className="flex w-full items-center gap-2">
-                  <Badge variant="outline">{t(`mention.${item.kind}`)}</Badge>
+                  <Badge variant="outline">{mentionKinds.find((kind) => kind.kind === item.kind)?.label}</Badge>
                   <span className="truncate text-sm">{item.label}</span>
                   <span className="ml-auto shrink-0 text-muted-foreground text-xs">#{item.id}</span>
                 </span>
@@ -307,19 +313,19 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
           </div>
           {!categories.length && (
             <p className="px-2 py-1 text-muted-foreground text-xs">
-              {loadingMore && <span role="status">{t("mention.loadingMore")}</span>}
+              {loadingMore && <span role="status">{t("Loading more…")}</span>}
               {!loadingMore && nextCursor && (
                 <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={loadMore}>
-                  {pageError ? t("mention.retryPage") : t("mention.more", { count: items.length })}
+                  {pageError
+                    ? t("Failed to load, click to retry")
+                    : t("Showing {count}, scroll down for more", { count: items.length })}
                 </button>
               )}
+              {!loadingMore && !nextCursor && !loading && !error && items.length > 0 && t("All {count} shown", { count: items.length })}
               {!loadingMore &&
                 !nextCursor &&
-                !loading &&
-                !error &&
-                items.length > 0 &&
-                t("mention.all", { count: items.length })}
-              {!loadingMore && !nextCursor && (loading || !!error || items.length === 0) && t("mention.searchHelp")}
+                (loading || !!error || items.length === 0) &&
+                t("Type a name, address, or ID to search records")}
             </p>
           )}
         </PopoverContent>
@@ -334,7 +340,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               <button
                 type="button"
                 disabled={disabled}
-                aria-label={t("mention.remove", { label: item.label })}
+                aria-label={t("Remove reference {label}", { label: item.label })}
                 onClick={() => {
                   onValueChange(value.slice(0, item.start) + value.slice(item.start + item.token.length));
                   setCursor(null);
@@ -344,7 +350,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               </button>
             </Badge>
           ))}
-          <span className="text-muted-foreground text-xs">{t("mention.limit")}</span>
+          <span className="text-muted-foreground text-xs">{t("Latest details read on send · Up to 10 records")}</span>
         </div>
       )}
     </div>

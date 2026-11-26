@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Run a command with a shell-like argument string.
+
+Custom ARTEX tools pass their free-form `args` as one shell-quoted value; this
+wrapper splits it back into argv so multi-flag commands work as the model expects.
+"""
+import shlex
+import subprocess
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: artex-run <binary> [args...]", file=sys.stderr)
+        return 2
+    args: list[str] = []
+    for part in sys.argv[2:]:
+        args.extend(shlex.split(part))
+    try:
+        return subprocess.call([sys.argv[1], *args])
+    except FileNotFoundError:
+        print(f"artex-run: {sys.argv[1]}: not found", file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

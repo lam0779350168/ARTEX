@@ -4,25 +4,23 @@ import { useEffect, useState } from "react";
 
 import { useRouter } from "next/navigation";
 
-import { useTranslation } from "react-i18next";
-
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { localizedError } from "@/i18n/errors";
+import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
 export default function SetupPage() {
-  const { t } = useTranslation();
   const router = useRouter();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [error, setError] = useState<unknown>("");
+  const [setupToken, setSetupToken] = useState("");
+  const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
-  // 查不到初始化状态时不能默认当成"未初始化"——那样会把初始化表单摆给一个
-  // 其实已经设过密码的实例，用户照着填就会覆盖掉原密码。此时关闭入口。
+  // when the initialization state cannot be fetched, do not default to "not initialized" — that would show the setup form to an
+  // instance that already has a password, and following it would overwrite the original. Close the entrance instead.
   const [unavailable, setUnavailable] = useState(false);
 
   useEffect(() => {
@@ -32,7 +30,7 @@ export default function SetupPage() {
         if (initialized) router.replace("/login");
       })
       .catch((err) => {
-        setError(err);
+        setError(err instanceof Error ? err.message : t("Unable to connect to the backend service"));
         setUnavailable(true);
       })
       .finally(() => setChecking(false));
@@ -41,21 +39,21 @@ export default function SetupPage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (password !== confirm) {
-      setError("auth.passwordMismatch");
+      setError(t("The two passwords do not match"));
       return;
     }
-    if (password.length < 8) {
-      setError("auth.passwordMin");
+    if (password.length < 12) {
+      setError(t("Password must be at least 12 characters"));
       return;
     }
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, setupToken.trim());
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
-      setError(err);
+      setError(err instanceof Error ? err.message : t("Initialization failed"));
     } finally {
       setLoading(false);
     }
@@ -80,48 +78,66 @@ export default function SetupPage() {
       <div className="flex w-full items-center justify-center bg-background p-8 lg:w-2/3">
         <div className="w-full max-w-md space-y-10 py-24 lg:py-32">
           <div className="space-y-4 text-center">
-            <h2 className="text-2xl font-medium tracking-tight">
-              {unavailable ? t("auth.statusUnknown") : t("auth.initPassword")}
-            </h2>
+            <h2 className="text-2xl font-medium tracking-tight">{unavailable ? t("Cannot confirm initialization state") : t("Set initial password")}</h2>
             <p className="mx-auto max-w-xl text-muted-foreground">
-              {unavailable ? t("auth.setupUnavailable") : t("auth.setupWelcome")}
+              {unavailable
+                ? t(
+                    "The backend or database is temporarily unavailable. To avoid overwriting a password already set on this instance, setup is temporarily closed — restore the service and try again.",
+                  )
+                : t(
+                    "First time using ARTEX? Enter the setup token from the server log, then set a login password for the account (at least 12 characters)",
+                  )}
             </p>
           </div>
           {unavailable ? (
             <div className="flex flex-col gap-4">
-              {Boolean(error) && <p className="text-center text-sm text-destructive">{localizedError(error, t)}</p>}
+              {error && <p className="text-center text-sm text-destructive">{error}</p>}
               <Button type="button" className="w-full" onClick={() => window.location.reload()}>
-                {t("common.retry")}
+                {t("Retry")}
               </Button>
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
               <div className="space-y-1.5">
-                <Label htmlFor="password">{t("account.newPassword")}</Label>
+                <Label htmlFor="setup-token">{t("Setup token")}</Label>
+                <Input
+                  id="setup-token"
+                  value={setupToken}
+                  onChange={(e) => setSetupToken(e.target.value)}
+                  placeholder={t("Printed in the server log at startup")}
+                  autoFocus
+                  autoComplete="off"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="password">{t("New password")}</Label>
                 <Input
                   id="password"
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder={t("auth.minPlaceholder")}
-                  autoFocus
+                  placeholder={t("At least 12 characters")}
                   autoComplete="new-password"
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="confirm">{t("auth.confirmPassword")}</Label>
+                <Label htmlFor="confirm">{t("Confirm password")}</Label>
                 <Input
                   id="confirm"
                   type="password"
                   value={confirm}
                   onChange={(e) => setConfirm(e.target.value)}
-                  placeholder={t("auth.reenterPassword")}
+                  placeholder={t("Enter the password again")}
                   autoComplete="new-password"
                 />
               </div>
-              {Boolean(error) && <p className="text-sm text-destructive">{localizedError(error, t)}</p>}
-              <Button type="submit" className="w-full" disabled={loading || !password || !confirm}>
-                {loading ? t("auth.saving") : t("auth.setupAndLogin")}
+              {error && <p className="text-sm text-destructive">{error}</p>}
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={loading || !setupToken.trim() || !password || !confirm}
+              >
+                {loading ? t("Saving...") : t("Set password and sign in")}
               </Button>
             </form>
           )}

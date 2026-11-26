@@ -1,8 +1,6 @@
 "use client";
+
 import * as React from "react";
-
-import { useSearchParams } from "next/navigation";
-
 import {
   DownloadIcon,
   FileIcon,
@@ -18,15 +16,34 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Sheet, SheetContent, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Sheet,
+  SheetContent,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { WorkspaceEntry, WorkspaceFile } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { intlLocale, t } from "@/i18n";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -34,8 +51,8 @@ function fmtSize(n: number): string {
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
-function fmtTime(ms: number, ui: UITranslate): string {
-  return new Date(ms).toLocaleString(ui("screen.91610255157661"), {
+function fmtTime(ms: number): string {
+  return new Date(ms).toLocaleString(intlLocale, {
     year: "2-digit",
     month: "2-digit",
     day: "2-digit",
@@ -51,11 +68,7 @@ type EditState = {
   saving: boolean;
 };
 
-function WorkspaceInner() {
-  const searchParams = useSearchParams();
-  const requestedPath = searchParams.get("path") ?? "";
-  const { ui, liveUI } = useUITranslation();
-
+export default function WorkspacePage() {
   const [path, setPath] = React.useState("");
   const [entries, setEntries] = React.useState<WorkspaceEntry[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -73,55 +86,32 @@ function WorkspaceInner() {
           setEntries(r.entries);
           setPath(r.path);
         })
-        .catch((e) => toast.error(liveUI("screen.d9861c29979739", { v0: (e as Error).message })))
+        .catch((e) => toast.error(t("Failed to read directory: {error}", { error: (e as Error).message })))
         .finally(() => setLoading(false));
     },
-    [liveUI],
+    [],
   );
 
   React.useEffect(() => {
-    let alive = true;
-    // A path may identify a file or a directory. Directory listing wins;
-    // otherwise open the file and show its containing directory.
-    void api
-      .workspaceList(requestedPath)
-      .then((result) => {
-        if (!alive) return;
-        setEntries(result.entries);
-        setPath(result.path);
-        setLoading(false);
-      })
-      .catch(async () => {
-        if (!alive) return;
-        load(requestedPath.split("/").slice(0, -1).join("/"));
-        try {
-          const file = await api.workspaceRead(requestedPath);
-          if (alive) setEdit({ file, content: file.content ?? "", dirty: false, saving: false });
-        } catch (error) {
-          if (alive) toast.error((error as Error).message);
-        }
-      });
-    return () => {
-      alive = false;
-    };
-  }, [load, requestedPath]);
+    load("");
+  }, [load]);
 
   const crumbs = React.useMemo(() => {
     const parts = path ? path.split("/") : [];
-    const acc: { name: string; path: string }[] = [{ name: ui("screen.6fed7e86016823"), path: "" }];
+    const acc: { name: string; path: string }[] = [{ name: t("Workspace"), path: "" }];
     let cur = "";
     for (const part of parts) {
       cur = cur ? `${cur}/${part}` : part;
       acc.push({ name: part, path: cur });
     }
     return acc;
-  }, [path, ui]);
+  }, [path]);
 
   const openFile = (e: WorkspaceEntry) => {
     api
       .workspaceRead(e.path)
       .then((f) => setEdit({ file: f, content: f.content ?? "", dirty: false, saving: false }))
-      .catch((err) => toast.error(ui("screen.076ee27586c9a7", { v0: (err as Error).message })));
+      .catch((err) => toast.error(t("Failed to open file: {error}", { error: (err as Error).message })));
   };
 
   const saveFile = () => {
@@ -130,34 +120,28 @@ function WorkspaceInner() {
     api
       .workspaceWrite(edit.file.path, edit.content)
       .then(() => {
-        toast.success(ui("screen.1bd91a7d0c53c9"));
+        toast.success(t("Saved"));
         setEdit((cur) => (cur ? { ...cur, dirty: false, saving: false } : cur));
         load(path);
       })
       .catch((err) => {
-        toast.error(ui("screen.20e1b0f2590bc7", { v0: (err as Error).message }));
+        toast.error(t("Save failed: {error}", { error: (err as Error).message }));
         setEdit((cur) => (cur ? { ...cur, saving: false } : cur));
       });
   };
 
   const del = (e: WorkspaceEntry) => {
-    if (
-      !window.confirm(
-        ui("screen.3a786999516d49", {
-          v0: e.dir ? ui("screen.52daa71ebc3105") : ui("screen.39932f24fe11a6"),
-          v1: e.name,
-          v2: e.dir ? ui("screen.ae5d8ac7afd3cb") : "",
-        }),
-      )
-    )
-      return;
+    const question = e.dir
+      ? t('Confirm deleting directory "{name}"? (including everything inside)', { name: e.name })
+      : t('Confirm deleting file "{name}"?', { name: e.name });
+    if (!window.confirm(question)) return;
     api
       .workspaceDelete(e.path)
       .then(() => {
-        toast.success(ui("screen.077a6d37719a0e"));
+        toast.success(t("Deleted"));
         load(path);
       })
-      .catch((err) => toast.error(ui("screen.77dcc9d08e857c", { v0: (err as Error).message })));
+      .catch((err) => toast.error(t("Delete failed: {error}", { error: (err as Error).message })));
   };
 
   const doUpload = (files: FileList | null) => {
@@ -165,10 +149,10 @@ function WorkspaceInner() {
     api
       .workspaceUpload(path, Array.from(files))
       .then((r) => {
-        toast.success(ui("screen.dc75e034e98100", { v0: r.uploaded }));
+        toast.success(t("Uploaded {count} files", { count: r.uploaded }));
         load(path);
       })
-      .catch((err) => toast.error(ui("screen.a6794c150f204c", { v0: (err as Error).message })))
+      .catch((err) => toast.error(t("Upload failed: {error}", { error: (err as Error).message })))
       .finally(() => {
         if (uploadRef.current) uploadRef.current.value = "";
       });
@@ -181,17 +165,17 @@ function WorkspaceInner() {
     api
       .workspaceMkdir(target)
       .then(() => {
-        toast.success(ui("screen.c28d7343946db1"));
+        toast.success(t("Directory created"));
         setMkdirOpen(false);
         setMkdirName("");
         load(path);
       })
-      .catch((err) => toast.error(ui("screen.12a4969260f84f", { v0: (err as Error).message })));
+      .catch((err) => toast.error(t("Create failed: {error}", { error: (err as Error).message })));
   };
 
   return (
     <div className="flex flex-col gap-4">
-      {/* 头部：面包屑 + 操作 */}
+      {/* Header: breadcrumb + actions */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-1 text-sm">
           <HardDriveIcon className="text-muted-foreground mr-1 size-4 shrink-0" />
@@ -213,21 +197,21 @@ function WorkspaceInner() {
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => setMkdirOpen(true)}>
-            <FolderPlusIcon /> {ui("screen.84244abc71de03")}
+            <FolderPlusIcon /> {t("New folder")}
           </Button>
           <Button variant="outline" size="sm" onClick={() => uploadRef.current?.click()}>
-            <UploadIcon /> {ui("screen.9e07e3c0532d49")}
+            <UploadIcon /> {t("Upload")}
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8"
-            onClick={() => load(path)}
-            title={ui("screen.aee88743413144")}
-          >
+          <Button variant="ghost" size="icon" className="size-8" onClick={() => load(path)} title={t("Refresh")}>
             <RefreshCwIcon className={cn("size-4", loading && "animate-spin")} />
           </Button>
-          <input ref={uploadRef} type="file" multiple className="hidden" onChange={(e) => doUpload(e.target.files)} />
+          <input
+            ref={uploadRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => doUpload(e.target.files)}
+          />
         </div>
       </div>
 
@@ -236,17 +220,17 @@ function WorkspaceInner() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>{ui("screen.d44e9b3d3b31d3")}</TableHead>
-                <TableHead className="w-28 text-right">{ui("screen.50db7447b966f5")}</TableHead>
-                <TableHead className="w-40">{ui("screen.257bbcc44c839d")}</TableHead>
-                <TableHead className="w-24 text-right">{ui("screen.ed31fbb483ee1b")}</TableHead>
+                <TableHead>{t("Name")}</TableHead>
+                <TableHead className="w-28 text-right">{t("Size")}</TableHead>
+                <TableHead className="w-40">{t("Modified")}</TableHead>
+                <TableHead className="w-24 text-right">{t("Actions")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {entries.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={4} className="text-muted-foreground py-10 text-center text-sm">
-                    {loading ? ui("screen.4927a53bcc886a") : ui("screen.3ea0e6e41518ea")}
+                    {loading ? t("Loading…") : t("Empty directory")}
                   </TableCell>
                 </TableRow>
               )}
@@ -269,7 +253,7 @@ function WorkspaceInner() {
                   <TableCell className="text-muted-foreground text-right font-mono text-xs">
                     {e.dir ? "—" : fmtSize(e.size)}
                   </TableCell>
-                  <TableCell className="text-muted-foreground text-xs">{fmtTime(e.mtime, ui)}</TableCell>
+                  <TableCell className="text-muted-foreground text-xs">{fmtTime(e.mtime)}</TableCell>
                   <TableCell>
                     <div className="flex items-center justify-end gap-1">
                       {!e.dir && (
@@ -277,11 +261,13 @@ function WorkspaceInner() {
                           variant="ghost"
                           size="icon"
                           className="size-7"
-                          title={ui("screen.4673a230616561")}
+                          title={t("Download")}
                           onClick={() =>
                             api
                               .workspaceDownload(e.path)
-                              .catch((err) => toast.error(ui("screen.0c40112af71437", { v0: (err as Error).message })))
+                              .catch((err) =>
+                                toast.error(t("Download failed: {error}", { error: (err as Error).message })),
+                              )
                           }
                         >
                           <DownloadIcon className="size-3.5" />
@@ -291,7 +277,7 @@ function WorkspaceInner() {
                         variant="ghost"
                         size="icon"
                         className="text-destructive size-7"
-                        title={ui("screen.2f9daa828907b9")}
+                        title={t("Delete")}
                         onClick={() => del(e)}
                       >
                         <Trash2Icon className="size-3.5" />
@@ -305,7 +291,7 @@ function WorkspaceInner() {
         </CardContent>
       </Card>
 
-      {/* 文件查看 / 编辑 */}
+      {/* File view / edit */}
       <Sheet open={edit !== null} onOpenChange={(o) => !o && setEdit(null)}>
         <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-2xl">
           {edit && (
@@ -323,10 +309,12 @@ function WorkspaceInner() {
               {edit.file.binary || edit.file.too_large ? (
                 <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
                   <p className="text-muted-foreground text-sm">
-                    {edit.file.too_large ? ui("screen.15678c48f7988d") : ui("screen.c54a32ff99392f")}
+                    {edit.file.too_large
+                      ? t("File too large for online preview/editing.")
+                      : t("Binary file; online preview/editing is not supported.")}
                   </p>
                   <Button variant="outline" onClick={() => api.workspaceDownload(edit.file.path)}>
-                    <DownloadIcon /> {ui("screen.3926d1bb98be84")}
+                    <DownloadIcon /> {t("Download file")}
                   </Button>
                 </div>
               ) : (
@@ -341,14 +329,17 @@ function WorkspaceInner() {
                   </div>
                   <SheetFooter className="flex-row items-center justify-between border-t p-3">
                     <span className="text-muted-foreground text-xs">
-                      {edit.dirty ? ui("screen.5e531ad8243728") : ui("screen.04062edb583b7c")}
+                      {edit.dirty ? t("Unsaved changes") : t("In sync")}
                     </span>
                     <div className="flex gap-2">
-                      <Button variant="outline" onClick={() => api.workspaceDownload(edit.file.path)}>
-                        <DownloadIcon /> {ui("screen.4673a230616561")}
+                      <Button
+                        variant="outline"
+                        onClick={() => api.workspaceDownload(edit.file.path)}
+                      >
+                        <DownloadIcon /> {t("Download")}
                       </Button>
                       <Button onClick={saveFile} disabled={!edit.dirty || edit.saving}>
-                        <SaveIcon /> {edit.saving ? ui("screen.ff509c9ba052a2") : ui("screen.a3030bf8f16dc6")}
+                        <SaveIcon /> {edit.saving ? t("Saving…") : t("Save")}
                       </Button>
                     </div>
                   </SheetFooter>
@@ -359,37 +350,29 @@ function WorkspaceInner() {
         </SheetContent>
       </Sheet>
 
-      {/* 新建文件夹 */}
+      {/* New folder */}
       <Dialog open={mkdirOpen} onOpenChange={setMkdirOpen}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle>{ui("screen.84244abc71de03")}</DialogTitle>
+            <DialogTitle>{t("New folder")}</DialogTitle>
           </DialogHeader>
           <Input
             autoFocus
             value={mkdirName}
             onChange={(e) => setMkdirName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && doMkdir()}
-            placeholder={ui("screen.bacf701908d8cf")}
+            placeholder={t("Folder name")}
           />
           <DialogFooter>
             <Button variant="outline" onClick={() => setMkdirOpen(false)}>
-              {ui("screen.2cd0f3be8738a8")}
+              {t("Cancel")}
             </Button>
             <Button onClick={doMkdir} disabled={!mkdirName.trim()}>
-              {ui("screen.cde2cd071d25bb")}
+              {t("Create")}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
-  );
-}
-
-export default function WorkspacePage() {
-  return (
-    <React.Suspense fallback={null}>
-      <WorkspaceInner />
-    </React.Suspense>
   );
 }

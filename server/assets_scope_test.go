@@ -17,7 +17,7 @@ func TestCompanyScopeInputsAcceptStructuredAndLegacyRules(t *testing.T) {
 	var inputs companyScopeInputs
 	if err := json.Unmarshal([]byte(`[
 		"example.com",
-		{"kind":"icp","value":"京 ICP备 123号"},
+		{"kind":"icp","value":"Beijing ICP No. 123"},
 		{"kind":"keyword","value":"Acme Security"}
 	]`), &inputs); err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func TestCompanyScopeInputsAcceptStructuredAndLegacyRules(t *testing.T) {
 func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 
@@ -76,7 +76,7 @@ func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.
 func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 
@@ -117,7 +117,7 @@ func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	s := &Server{m: m}
@@ -137,7 +137,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 		body, err := json.Marshal(map[string]any{
 			"name": "Oversized Scope",
 			"scope": []map[string]string{{
-				"kind": "keyword", "value": strings.Repeat("界", db.MaxCompanyScopeRawRunes+1),
+				"kind": "keyword", "value": strings.Repeat("x", db.MaxCompanyScopeRawRunes+1),
 			}},
 		})
 		if err != nil {
@@ -191,7 +191,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 func TestListAssetsClassifiesValidationAndDatabaseErrors(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	s := &Server{m: m}
@@ -217,7 +217,7 @@ func TestListAssetsClassifiesValidationAndDatabaseErrors(t *testing.T) {
 func TestDeleteCompanyRejectsBadJSONAndReportsMissing(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	s := &Server{m: m}
@@ -256,7 +256,7 @@ func TestDeleteCompanyRejectsBadJSONAndReportsMissing(t *testing.T) {
 func TestCompanyScopeSystemFailureIsHTTP500(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	s := &Server{m: m}

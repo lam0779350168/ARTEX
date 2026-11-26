@@ -4,28 +4,23 @@ import * as React from "react";
 
 import Link from "next/link";
 
-import type { TFunction } from "i18next";
 import {
   ActivityIcon,
   ArrowUpRightIcon,
   BugIcon,
   ClockIcon,
-  CpuIcon,
-  HardDriveIcon,
-  MemoryStickIcon,
   NetworkIcon,
   ShieldCheckIcon,
   TargetIcon,
   ZapIcon,
 } from "lucide-react";
-import { Bar, BarChart, CartesianGrid, Tooltip as RechartsTooltip, XAxis, YAxis } from "recharts";
+import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { api } from "@/lib/api";
 import type {
   Activity,
@@ -38,7 +33,6 @@ import type {
   Settings,
   SkillItem,
   Stats,
-  SystemMetrics,
   Task,
   TokenTotal,
   Tool,
@@ -46,21 +40,29 @@ import type {
   UsageStats,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { t } from "@/i18n";
+import { setVisibleInterval } from "@/lib/polling";
 
 // ── chart constants ───────────────────────────────────────────────────────────
 
+const dailyTrendConfig = {
+  input: { label: t("Input"), color: "hsl(217 91% 60%)" },
+  output: { label: t("Output"), color: "hsl(263 70% 60%)" },
+  cacheRead: { label: t("Cache read"), color: "hsl(160 60% 45%)" },
+} satisfies ChartConfig;
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function fmtRel(ts: string | number | undefined, translate: TFunction): string {
+function fmtRel(ts?: string | number): string {
   if (!ts) return "—";
   const ms = Date.now() - (typeof ts === "number" ? ts * 1000 : Date.parse(ts as string));
   const s = Math.floor(ms / 1000);
-  if (s < 60) return translate("overview.secondsAgo", { count: s });
+  if (s < 60) return t("{n}s ago", { n: s });
   const m = Math.floor(s / 60);
-  if (m < 60) return translate("overview.minutesAgo", { count: m });
+  if (m < 60) return t("{n}m ago", { n: m });
   const h = Math.floor(m / 60);
-  if (h < 24) return translate("overview.hoursAgo", { count: h });
-  return translate("overview.daysAgo", { count: Math.floor(h / 24) });
+  if (h < 24) return t("{n}h ago", { n: h });
+  return t("{n}d ago", { n: Math.floor(h / 24) });
 }
 
 function fmtTokens(n: number): string {
@@ -68,6 +70,15 @@ function fmtTokens(n: number): string {
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
 }
+
+const ASSET_TYPE_LABELS: Record<string, string> = {
+  root_domain: t("Root domain"),
+  ip: "IP",
+  subdomain: t("Subdomain"),
+  app: t("App"),
+  service: t("Service"),
+  endpoint: t("Endpoint"),
+};
 
 const ASSET_COLORS: Record<string, string> = {
   root_domain: "bg-blue-500",
@@ -90,47 +101,6 @@ function statusBg(code: number): string {
   if (code < 400) return "bg-blue-400";
   if (code < 500) return "bg-amber-400";
   return "bg-red-400";
-}
-
-function SystemResourceStatus({ metrics }: { metrics: SystemMetrics | null }) {
-  const { t: translate } = useLiveTranslation();
-  if (!metrics) return null;
-  if (!metrics.supported) {
-    return (
-      <div className="ml-auto text-xs text-muted-foreground" role="status">
-        {translate("overview.resourceUnsupported")}
-      </div>
-    );
-  }
-  const items = [
-    [CpuIcon, "CPU", metrics.cpu.percent],
-    [MemoryStickIcon, translate("overview.memory"), metrics.memory.percent],
-    [HardDriveIcon, translate("overview.disk"), metrics.data_disk.percent],
-  ] as const;
-  return (
-    <div
-      className="ml-auto flex min-w-0 items-center justify-end gap-3 text-xs text-muted-foreground"
-      role="status"
-      aria-live="polite"
-    >
-      <span className="shrink-0 font-medium">{translate("overview.containerResources")}</span>
-      {items.map(([Icon, label, value]) => (
-        <div key={label} className="w-24 min-w-0" title={`${label} ${value.toFixed(1)}%`}>
-          <div className="mb-1 flex items-center justify-between gap-1 text-[10px]">
-            <span className="inline-flex items-center gap-1">
-              <Icon className="size-3" aria-hidden="true" />
-              {label}
-            </span>
-            <span className="tabular-nums">{value.toFixed(1)}%</span>
-          </div>
-          <Progress
-            value={value}
-            className="h-2 bg-muted [&_[data-slot=progress-indicator]]:bg-slate-500 dark:[&_[data-slot=progress-indicator]]:bg-slate-400"
-          />
-        </div>
-      ))}
-    </div>
-  );
 }
 
 // ── sub-components ────────────────────────────────────────────────────────────
@@ -162,20 +132,6 @@ function SectionTitle({
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
-  const { t: translate } = useLiveTranslation();
-  const dailyTrendConfig = {
-    input: { label: translate("overview.input"), color: "hsl(217 91% 60%)" },
-    output: { label: translate("overview.output"), color: "hsl(263 70% 60%)" },
-    cacheRead: { label: translate("overview.cacheRead"), color: "hsl(160 60% 45%)" },
-  } satisfies ChartConfig;
-  const ASSET_TYPE_LABELS: Record<string, string> = {
-    root_domain: translate("overview.asset.root_domain"),
-    ip: "IP",
-    subdomain: translate("overview.asset.subdomain"),
-    app: translate("overview.asset.app"),
-    service: translate("overview.asset.service"),
-    endpoint: translate("overview.asset.endpoint"),
-  };
   // data state
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
@@ -193,25 +149,6 @@ export default function DashboardPage() {
   const [skills, setSkills] = React.useState<SkillItem[]>([]);
   const [tools, setTools] = React.useState<Tool[]>([]);
   const [llmProfiles, setLLMProfiles] = React.useState<LLMProfile[]>([]);
-  const [systemMetrics, setSystemMetrics] = React.useState<SystemMetrics | null>(null);
-
-  React.useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      try {
-        const next = await api.systemMetrics();
-        if (alive) setSystemMetrics(next);
-      } catch {
-        /* retry on the next interval */
-      }
-    };
-    void load();
-    const timer = setInterval(load, 5000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
-  }, []);
 
   // The task list is the most expensive dashboard source. Poll it independently
   // so a large history cannot hold back every other dashboard panel.
@@ -237,10 +174,10 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const t = setInterval(load, 5000);
+    const stopPolling = setVisibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stopPolling();
     };
   }, []);
 
@@ -276,10 +213,10 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const timer = setInterval(load, 5000);
+    const stopPolling = setVisibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stopPolling();
     };
   }, []);
 
@@ -312,10 +249,10 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const t = setInterval(load, 15000);
+    const stopPolling = setVisibleInterval(load, 15000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stopPolling();
     };
   }, []);
 
@@ -393,14 +330,14 @@ export default function DashboardPage() {
   // tasks whose llm_profile_id is null/undefined used the active default profile
   const defaultProfileId = activeProfile ? Number(activeProfile.id) : null;
 
-  // 数据源开关：旧版 = activity（task.tokens + 会话），新版 = llm_usage 计量账本。
+  // Data source toggle: old = activity (task.tokens + conversations), new = the llm_usage metering ledger.
   const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("old");
-  // selected profile tab: "all" = 全部; number = specific profile id
+  // selected profile tab: "all" = all; number = specific profile id
   const [tokenTab, setTokenTab] = React.useState<number | null | "all">("all");
   // day range for the daily bar chart
   const [tokenDays, setTokenDays] = React.useState<7 | 30 | 90 | 180 | 365>(30);
 
-  // profile 名 → id，用于把 llm_usage 的 profile_name 映射到现有 profile 分栏。
+  // profile name → id, mapping llm_usage profile_name to the existing profile tabs.
   const profileIdByName = React.useMemo(() => {
     const m = new Map<string, number>();
     for (const p of llmProfiles) m.set(p.name, Number(p.id));
@@ -409,7 +346,7 @@ export default function DashboardPage() {
 
   type Bucket = { input: number; output: number; cacheRead: number; cacheWrite: number; taskCount: number };
 
-  // 旧版：按 profile 归桶（来自 activity 的 task.tokens + 会话用量）。
+  // Old: bucketed by profile (task.tokens from activity + conversation usage).
   const tokenByProfileOld = React.useMemo<Map<number | null, Bucket>>(() => {
     const m = new Map<number | null, Bucket>();
     const fold = (key: number | null, inp: number, out: number, cr: number, cw: number, addTask: boolean) => {
@@ -445,11 +382,11 @@ export default function DashboardPage() {
     return m;
   }, [tasks, convTokens, defaultProfileId]);
 
-  // 新版：按 profile 归桶（来自 llm_usage 全局聚合，逐次调用精确）。
+  // New: bucketed by profile (from the llm_usage global aggregate, exact per call).
   const tokenByProfileNew = React.useMemo<Map<number | null, Bucket>>(() => {
     const m = new Map<number | null, Bucket>();
     for (const p of usageStats?.by_profile ?? []) {
-      // 未匹配到现有 profile（改名/删除/空名）→ 落到默认桶，仍计入「全部」。
+      // No matching profile (renamed/deleted/empty name) → falls into the default bucket, still counted in "All".
       const key = profileIdByName.get(p.profile_name) ?? defaultProfileId;
       const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
       m.set(key, {
@@ -487,7 +424,7 @@ export default function DashboardPage() {
       : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
   }, [tokenTab, tokenByProfile]);
 
-  // 旧版每日：把任务/会话的总量按其创建日期归桶（近似，非真实每日消耗）。
+  // Old daily: buckets each task/conversation's total by its creation date (approximate, not real daily spend).
   const dailyTokenDataOld = React.useMemo(() => {
     const now = new Date();
     now.setDate(now.getDate() - tokenDays);
@@ -514,7 +451,7 @@ export default function DashboardPage() {
     return [...m.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date: date.slice(5), ...v }));
   }, [tasks, convTokens, tokenDays, tokenTab, defaultProfileId]);
 
-  // 新版每日：来自 llm_usage 的真实每日消耗（ts 是实际调用时刻）。
+  // New daily: real daily spend from llm_usage (ts is the actual call time).
   const dailyTokenDataNew = React.useMemo(() => {
     const now = new Date();
     now.setDate(now.getDate() - tokenDays);
@@ -537,9 +474,9 @@ export default function DashboardPage() {
 
   // activity kind label
   function kindLabel(a: Activity): string {
-    if (a.kind === "tool_use") return a.tool ?? "tool_use";
-    if (a.kind === "tool_result") return "tool_result";
-    return a.kind;
+    if (a.kind === "tool_use") return a.tool ?? t("tool_use");
+    if (a.kind === "tool_result") return t("tool_result");
+    return t(a.kind);
   }
 
   function workerColor(w: string): string {
@@ -560,23 +497,19 @@ export default function DashboardPage() {
     <div className="flex flex-1 flex-col gap-4 pb-6">
       {/* ── Header ── */}
       <div>
-        <div className="flex items-center gap-6">
-          <div>
-            <h1 className="text-lg font-semibold tracking-tight">{translate("overview.title")}</h1>
-            <p className="text-xs text-muted-foreground">{translate("overview.subtitle")}</p>
-          </div>
-          <SystemResourceStatus metrics={systemMetrics} />
+        <div>
+          <h1 className="text-lg font-semibold tracking-tight">{t("Overview")}</h1>
+          <p className="text-xs text-muted-foreground">{t("System-wide status · live refresh")}</p>
         </div>
       </div>
 
       {/* ── Row 1: 5 stat cards ── */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        {/* 活跃任务 */}
+        {/* Active tasks */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <TargetIcon className="size-3" />
-              {translate("overview.activeTasks")}
+              <TargetIcon className="size-3" /> {t("Active tasks")}
             </div>
             <div className="flex items-baseline gap-1.5">
               <span className="text-2xl font-semibold tabular-nums">{tasksByStatus.running ?? 0}</span>
@@ -585,69 +518,50 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px]">
             {(tasksByStatus.running ?? 0) > 0 && (
-              <span className="text-blue-400">
-                {translate("overview.exploring")} {tasksByStatus.running}
-              </span>
+              <span className="text-blue-400">{t("Exploring {count}", { count: tasksByStatus.running })}</span>
             )}
             {(tasksByStatus.paused ?? 0) > 0 && (
-              <span className="text-amber-400">
-                {translate("overview.paused")} {tasksByStatus.paused}
-              </span>
+              <span className="text-amber-400">{t("Paused {count}", { count: tasksByStatus.paused })}</span>
             )}
             {(tasksByStatus.done ?? 0) > 0 && (
-              <span className="text-emerald-400">
-                {translate("overview.done")} {tasksByStatus.done}
-              </span>
+              <span className="text-emerald-400">{t("Completed {count}", { count: tasksByStatus.done })}</span>
             )}
-            {tasks.length === 0 && <span className="text-muted-foreground">{translate("overview.emptyTasks")}</span>}
+            {tasks.length === 0 && <span className="text-muted-foreground">{t("No tasks")}</span>}
           </CardContent>
         </Card>
 
-        {/* 确认发现 */}
+        {/* Confirmed findings */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <BugIcon className="size-3" />
-              {translate("overview.confirmedFindings")}
+              <BugIcon className="size-3" /> {t("Confirmed findings")}
             </div>
             <div className="text-2xl font-semibold tabular-nums">{findings.length}</div>
           </CardHeader>
           <CardContent className="flex flex-wrap gap-2.5 text-[10px]">
-            <span className="text-rose-500">
-              {translate("overview.critical")} {findingsBySev.critical}
-            </span>
-            <span className="text-red-400">
-              {translate("overview.high")} {findingsBySev.high}
-            </span>
-            <span className="text-amber-400">
-              {translate("overview.medium")} {findingsBySev.medium}
-            </span>
-            <span className="text-slate-400">
-              {translate("overview.low")} {findingsBySev.low}
-            </span>
+            <span className="text-rose-500">{t("Critical {count}", { count: findingsBySev.critical })}</span>
+            <span className="text-red-400">{t("High {count}", { count: findingsBySev.high })}</span>
+            <span className="text-amber-400">{t("Medium {count}", { count: findingsBySev.medium })}</span>
+            <span className="text-slate-400">{t("Low {count}", { count: findingsBySev.low })}</span>
           </CardContent>
         </Card>
 
-        {/* 资产节点 */}
+        {/* Asset nodes */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <NetworkIcon className="size-3" />
-              {translate("overview.assetNodes")}
+              <NetworkIcon className="size-3" /> {t("Asset nodes")}
             </div>
             <div className="text-2xl font-semibold tabular-nums">{totalAssets}</div>
           </CardHeader>
-          <CardContent className="text-[10px] text-muted-foreground">
-            {translate("overview.sharedAcrossTasks")}
-          </CardContent>
+          <CardContent className="text-[10px] text-muted-foreground">{t("Shared across tasks")}</CardContent>
         </Card>
 
-        {/* 流量交互 */}
+        {/* Traffic exchanges */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <ActivityIcon className="size-3" />
-              {translate("overview.trafficExchanges")}
+              <ActivityIcon className="size-3" /> {t("Traffic exchanges")}
             </div>
             <div className="text-2xl font-semibold tabular-nums">{traffic.length}</div>
           </CardHeader>
@@ -655,27 +569,26 @@ export default function DashboardPage() {
             {settings?.traffic_capture ? (
               <>
                 <LiveDot />
-                <span>{translate("overview.recording")}</span>
+                <span>{t("Recording")}</span>
               </>
             ) : (
-              <span>{translate("overview.captureDisabled")}</span>
+              <span>{t("Capture is off")}</span>
             )}
           </CardContent>
         </Card>
 
-        {/* LLM 用量 */}
+        {/* LLM usage */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <ZapIcon className="size-3" />
-              {translate("overview.tokenUsage")}
+              <ZapIcon className="size-3" /> {t("Token usage")}
             </div>
             <div className="text-2xl font-semibold tabular-nums">
               {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
             </div>
           </CardHeader>
           <CardContent className="text-[10px] text-muted-foreground">
-            {translate("overview.tokenBreakdown", {
+            {t("In {input} (incl. cache {cache}) · Out {output}", {
               input: fmtTokens(displayedTokens.input),
               cache: fmtTokens(displayedTokens.cacheRead),
               output: fmtTokens(displayedTokens.output),
@@ -684,19 +597,19 @@ export default function DashboardPage() {
         </Card>
       </div>
 
-      {/* ── Row 2: LLM Token 消耗 ── */}
+      {/* ── Row 2: LLM token usage ── */}
       <Card className="p-4">
         {/* Header */}
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 text-xs font-semibold">
             <ZapIcon className="size-3.5 text-muted-foreground" />
-            {translate("overview.llmTokens")}
-            {/* 数据源开关：旧版=activity 统计（含历史任务），新版=llm_usage 计量账本（更准，仅覆盖启用后） */}
+            {t("LLM token usage")}
+            {/* Data source toggle: old = activity stats (includes historical tasks), new = the llm_usage metering ledger (more accurate, only covers data since it was enabled) */}
             <div className="ml-1 flex gap-0.5 rounded-md border bg-muted/30 p-0.5">
               {(
                 [
-                  { v: "old", label: translate("overview.legacyMetrics") },
-                  { v: "new", label: translate("overview.ledgerMetrics") },
+                  { v: "old", label: t("Old") },
+                  { v: "new", label: t("New") },
                 ] as const
               ).map(({ v, label }) => (
                 <button
@@ -704,7 +617,13 @@ export default function DashboardPage() {
                   key={v}
                   onClick={() => setTokenVersion(v)}
                   title={
-                    v === "new" ? translate("overview.ledgerMetricsHelp") : translate("overview.legacyMetricsHelp")
+                    v === "new"
+                      ? t(
+                          "New: from the llm_usage metering ledger, exact per call and including aborted runs; only covers data since it was enabled",
+                        )
+                      : t(
+                          "Old: from activity stats (includes historical tasks); aborted runs are not counted and it cannot break down by model",
+                        )
                   }
                   className={cn(
                     "rounded px-2 py-0.5 text-[9px] font-medium transition-colors",
@@ -733,7 +652,7 @@ export default function DashboardPage() {
                   : "bg-muted/30 text-muted-foreground hover:text-foreground",
               )}
             >
-              {translate("overview.all")}
+              {t("All")}
             </button>
             {llmProfiles.map((p) => {
               const key = Number(p.id);
@@ -762,7 +681,7 @@ export default function DashboardPage() {
                           : "bg-emerald-500/20 text-emerald-400",
                       )}
                     >
-                      {translate("overview.default")}
+                      {t("Default")}
                     </span>
                   )}
                 </button>
@@ -777,35 +696,35 @@ export default function DashboardPage() {
           <div className="flex flex-col gap-4">
             {/* Total */}
             <div>
-              <div className="text-[10px] text-muted-foreground">{translate("overview.totalTokens")}</div>
+              <div className="text-[10px] text-muted-foreground">{t("Total (input+output)")}</div>
               <div className="mt-0.5 text-3xl font-bold tabular-nums tracking-tight">
                 {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
               </div>
               <div className="mt-0.5 text-[10px] text-muted-foreground">
-                {translate("overview.taskCount", { count: displayedTokens.taskCount })}
+                {t("{count} tasks", { count: displayedTokens.taskCount })}
               </div>
             </div>
 
             {/* Per-type bars */}
             <div className="space-y-3">
               {(() => {
-                // input 已含缓存；拆成不重叠三段：未命中输入 + 缓存命中 + 输出 = 总量。
+                // input already includes cache; split into three non-overlapping segments: uncached input + cache hits + output = total.
                 const total = displayedTokens.input + displayedTokens.output;
                 return [
                   {
-                    label: translate("overview.uncachedInput"),
+                    label: t("Input (uncached)"),
                     value: displayedTokens.input - displayedTokens.cacheRead,
                     barColor: dailyTrendConfig.input.color!,
                     text: "text-blue-400",
                   },
                   {
-                    label: translate("overview.cacheHit"),
+                    label: t("Cache hits"),
                     value: displayedTokens.cacheRead,
                     barColor: dailyTrendConfig.cacheRead.color!,
                     text: "text-emerald-400",
                   },
                   {
-                    label: translate("overview.output"),
+                    label: t("Output"),
                     value: displayedTokens.output,
                     barColor: dailyTrendConfig.output.color!,
                     text: "text-violet-400",
@@ -832,12 +751,12 @@ export default function DashboardPage() {
 
             {/* Cache hit rate */}
             {(() => {
-              // input 已含缓存 → 命中率 = 缓存命中 / 总输入。
+              // input already includes cache → hit rate = cache hits / total input.
               const denominator = displayedTokens.input;
               const hitPct = denominator > 0 ? Math.round((displayedTokens.cacheRead / denominator) * 100) : 0;
               return (
                 <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2 text-[10px]">
-                  <span className="text-muted-foreground">{translate("overview.cacheHitRate")}</span>
+                  <span className="text-muted-foreground">{t("Cache hit rate")}</span>
                   <span
                     className={cn("font-semibold tabular-nums", hitPct > 50 ? "text-emerald-400" : "text-amber-400")}
                   >
@@ -865,11 +784,11 @@ export default function DashboardPage() {
               <div className="flex gap-0.5 rounded-md border bg-muted/30 p-0.5">
                 {(
                   [
-                    { days: 7, label: translate("overview.sevenDays") },
-                    { days: 30, label: translate("overview.thirtyDays") },
-                    { days: 90, label: translate("overview.threeMonths") },
-                    { days: 180, label: translate("overview.sixMonths") },
-                    { days: 365, label: translate("overview.oneYear") },
+                    { days: 7, label: t("7d") },
+                    { days: 30, label: t("30d") },
+                    { days: 90, label: t("3mo") },
+                    { days: 180, label: t("6mo") },
+                    { days: 365, label: t("1y") },
                   ] as const
                 ).map(({ days, label }) => (
                   <button
@@ -894,7 +813,7 @@ export default function DashboardPage() {
                 className="flex flex-1 items-center justify-center rounded-lg border bg-muted/10 text-xs text-muted-foreground"
                 style={{ minHeight: 180 }}
               >
-                {translate("overview.noData")}
+                {t("No data")}
               </div>
             ) : (
               <ChartContainer config={dailyTrendConfig} className="h-[200px] w-full">
@@ -942,25 +861,24 @@ export default function DashboardPage() {
         </div>
       </Card>
 
-      {/* ── Row 3: 活动流 | 发现 ── */}
+      {/* ── Row 3: Activity feed | Findings ── */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-        {/* 活动流 */}
+        {/* Activity feed */}
         <Card className="p-4">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs font-semibold">
               <ActivityIcon className="size-3.5 text-muted-foreground" />
-              {translate("overview.activity")}
+              {t("Activity feed")}
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10px] text-muted-foreground">
-                {translate("overview.eventCount", { count: activity.filter((a) => a.kind !== "usage").length })}
+                {t("{count} events", { count: activity.filter((a) => a.kind !== "usage").length })}
               </span>
               <Link
                 href="/function/tasks"
                 className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
               >
-                {translate("overview.viewTasks")}
-                <ArrowUpRightIcon className="size-3" />
+                {t("View tasks")} <ArrowUpRightIcon className="size-3" />
               </Link>
             </div>
           </div>
@@ -971,7 +889,7 @@ export default function DashboardPage() {
               if (count === 0) return null;
               return (
                 <span key={kind} className="rounded border bg-muted/20 px-1.5 py-0.5 text-[9px] text-muted-foreground">
-                  {kind} <strong className="text-foreground/70">{count}</strong>
+                  {t(kind)} <strong className="text-foreground/70">{count}</strong>
                 </span>
               );
             })}
@@ -979,9 +897,7 @@ export default function DashboardPage() {
 
           <div className="divide-y">
             {recentActivity.length === 0 ? (
-              <div className="py-4 text-center text-xs text-muted-foreground">
-                {translate("overview.emptyActivity")}
-              </div>
+              <div className="py-4 text-center text-xs text-muted-foreground">{t("No activity records")}</div>
             ) : (
               recentActivity.map((a) => (
                 <div key={a.seq} className="flex gap-2.5 py-2">
@@ -999,11 +915,9 @@ export default function DashboardPage() {
                   </div>
                   <div className="shrink-0 text-right">
                     <Badge variant="outline" className="px-1.5 py-0 text-[9px] text-muted-foreground">
-                      {a.kind}
+                      {t(a.kind)}
                     </Badge>
-                    <div className="mt-0.5 text-[9px] tabular-nums text-muted-foreground">
-                      {fmtRel(a.ts, translate)}
-                    </div>
+                    <div className="mt-0.5 text-[9px] tabular-nums text-muted-foreground">{fmtRel(a.ts)}</div>
                   </div>
                 </div>
               ))
@@ -1011,27 +925,24 @@ export default function DashboardPage() {
           </div>
         </Card>
 
-        {/* 发现 */}
+        {/* Findings */}
         <Card className="p-4">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs font-semibold">
               <BugIcon className="size-3.5 text-muted-foreground" />
-              {translate("overview.findings")}
+              {t("Findings")}
             </div>
             <Link
               href="/function/findings"
               className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
             >
-              {translate("overview.all")}
-              <ArrowUpRightIcon className="size-3" />
+              {t("All")} <ArrowUpRightIcon className="size-3" />
             </Link>
           </div>
 
           <div className="divide-y">
             {recentFindings.length === 0 ? (
-              <div className="py-4 text-center text-xs text-muted-foreground">
-                {translate("overview.emptyFindings")}
-              </div>
+              <div className="py-4 text-center text-xs text-muted-foreground">{t("No findings")}</div>
             ) : (
               recentFindings.map((f) => (
                 <div key={f.id} className="flex items-start gap-2 py-2">
@@ -1051,9 +962,7 @@ export default function DashboardPage() {
                       {f.summary}
                     </div>
                   </div>
-                  <span className="shrink-0 text-[9px] tabular-nums text-muted-foreground">
-                    {fmtRel(f.ts, translate)}
-                  </span>
+                  <span className="shrink-0 text-[9px] tabular-nums text-muted-foreground">{fmtRel(f.ts)}</span>
                 </div>
               ))
             )}
@@ -1061,42 +970,32 @@ export default function DashboardPage() {
         </Card>
       </div>
 
-      {/* ── Row 4: 任务表格 ── */}
+      {/* ── Row 4: Task table ── */}
       <Card className="overflow-hidden p-0">
         <div className="flex items-center justify-between border-b px-4 py-3">
           <div className="flex items-center gap-1.5 text-xs font-semibold">
             <ClockIcon className="size-3.5 text-muted-foreground" />
-            {translate("overview.tasks")}
+            {t("Tasks")}
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground">
-              {translate("overview.taskCount", { count: tasks.length })}
-            </span>
+            <span className="text-[10px] text-muted-foreground">{t("{count} tasks", { count: tasks.length })}</span>
             <Link
               href="/function/tasks"
               className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
             >
-              {translate("overview.all")}
-              <ArrowUpRightIcon className="size-3" />
+              {t("All")} <ArrowUpRightIcon className="size-3" />
             </Link>
           </div>
         </div>
         <table className="w-full border-collapse text-xs">
           <thead>
             <tr className="border-b">
-              {[
-                translate("overview.tasks"),
-                translate("overview.status"),
-                translate("overview.engine"),
-                translate("overview.goalProgress"),
-                translate("overview.inFlight"),
-                translate("overview.lastActivity"),
-              ].map((h) => (
+              {["Task", "Status", "Engine", "Goal progress", "In flight", "Last activity"].map((h) => (
                 <th
                   key={h}
                   className="px-4 py-2 text-left text-[9px] font-semibold uppercase tracking-widest text-muted-foreground first:pl-4"
                 >
-                  {h}
+                  {t(h)}
                 </th>
               ))}
             </tr>
@@ -1105,7 +1004,7 @@ export default function DashboardPage() {
             {sortedTasks.length === 0 ? (
               <tr>
                 <td colSpan={6} className="px-4 py-6 text-center text-xs text-muted-foreground">
-                  {translate("overview.emptyTasks")}
+                  {t("No tasks")}
                 </td>
               </tr>
             ) : (
@@ -1120,13 +1019,7 @@ export default function DashboardPage() {
                       </Link>
                     </td>
                     <td className="px-4 py-3">
-                      <StatusBadge
-                        domain="task"
-                        value={t.status}
-                        stopReason={t.stop_reason}
-                        dot
-                        className="px-1.5 py-0 text-[10px]"
-                      />
+                      <StatusBadge domain="task" value={t.status} dot className="px-1.5 py-0 text-[10px]" />
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge
@@ -1155,7 +1048,7 @@ export default function DashboardPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 tabular-nums text-muted-foreground">
-                      {fmtRel(t.last_activity_unix ?? t.created_unix, translate)}
+                      {fmtRel(t.last_activity_unix ?? t.created_unix)}
                     </td>
                   </tr>
                 );
@@ -1165,16 +1058,16 @@ export default function DashboardPage() {
         </table>
       </Card>
 
-      {/* ── Row 5: 资产分布 | 流量状态码 | 拦截 & 待审批 ── */}
+      {/* ── Row 5: Asset distribution | Traffic status codes | Interception & pending approvals ── */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-        {/* 资产分布 */}
+        {/* Asset distribution */}
         <Card className="p-4">
-          <SectionTitle icon={NetworkIcon} sub={translate("overview.byType")}>
-            {translate("overview.assetDistribution")}
+          <SectionTitle icon={NetworkIcon} sub={t("By type")}>
+            {t("Asset distribution")}
           </SectionTitle>
 
           {assetByType.length === 0 ? (
-            <div className="py-6 text-center text-xs text-muted-foreground">{translate("overview.emptyAssets")}</div>
+            <div className="py-6 text-center text-xs text-muted-foreground">{t("No asset data")}</div>
           ) : (
             <div className="flex flex-col gap-2">
               {assetByType.map(([type, count]) => (
@@ -1195,19 +1088,19 @@ export default function DashboardPage() {
           )}
 
           <div className="mt-3 border-t pt-3 text-[10px] text-muted-foreground">
-            {translate("overview.nodeTotal", { count: totalAssets })}
+            {t("{count} nodes in total", { count: totalAssets })}
           </div>
         </Card>
 
-        {/* 流量状态码 */}
+        {/* Traffic status codes */}
         <Card className="p-4">
-          <SectionTitle icon={ActivityIcon} sub={translate("overview.requestCount", { count: traffic.length })}>
-            {translate("overview.trafficStatusCodes")}
+          <SectionTitle icon={ActivityIcon} sub={t("{count} requests", { count: traffic.length })}>
+            {t("Traffic status codes")}
           </SectionTitle>
 
           {/* bar chart */}
           {trafficByCodes.length === 0 ? (
-            <div className="py-6 text-center text-xs text-muted-foreground">{translate("overview.emptyTraffic")}</div>
+            <div className="py-6 text-center text-xs text-muted-foreground">{t("No traffic data")}</div>
           ) : (
             <>
               <div className="mb-3 flex items-end gap-2" style={{ height: 52 }}>
@@ -1224,7 +1117,7 @@ export default function DashboardPage() {
               </div>
 
               <div className="border-t pt-2.5">
-                <div className="mb-1.5 text-[10px] text-muted-foreground">{translate("overview.recentRequests")}</div>
+                <div className="mb-1.5 text-[10px] text-muted-foreground">{t("Recent requests")}</div>
                 <div className="flex flex-col gap-1.5">
                   {recentTraffic.map((e) => (
                     <div key={e.id} className="flex items-center gap-1.5 text-[10px]">
@@ -1251,13 +1144,13 @@ export default function DashboardPage() {
           )}
         </Card>
 
-        {/* 系统状态 & 待审批 */}
+        {/* System status & pending approvals */}
         <Card className="p-4">
-          <SectionTitle icon={ShieldCheckIcon}>{translate("overview.systemStatus")}</SectionTitle>
+          <SectionTitle icon={ShieldCheckIcon}>{t("System status")}</SectionTitle>
 
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
-              <div className="text-[10px] text-muted-foreground">{translate("overview.llmProfiles")}</div>
+              <div className="text-[10px] text-muted-foreground">{t("LLM config")}</div>
               <Badge
                 variant="outline"
                 className={cn(
@@ -1267,12 +1160,12 @@ export default function DashboardPage() {
                     : "border-red-500/30 bg-red-500/10 text-red-400",
                 )}
               >
-                {stats?.llm_configured ? translate("overview.configured") : translate("overview.notConfigured")}
+                {stats?.llm_configured ? t("Configured") : t("Not configured")}
               </Badge>
             </div>
 
             <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
-              <div className="text-[10px] text-muted-foreground">{translate("overview.trafficCapture")}</div>
+              <div className="text-[10px] text-muted-foreground">{t("Traffic capture")}</div>
               <Badge
                 variant="outline"
                 className={cn(
@@ -1282,13 +1175,13 @@ export default function DashboardPage() {
                     : "text-muted-foreground",
                 )}
               >
-                {settings?.traffic_capture ? translate("overview.enabled") : translate("overview.disabled")}
+                {settings?.traffic_capture ? t("On") : t("Off")}
               </Badge>
             </div>
 
             {activeProfile && (
               <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
-                <div className="text-[10px] text-muted-foreground">{translate("overview.activeModel")}</div>
+                <div className="text-[10px] text-muted-foreground">{t("Active model")}</div>
                 <span className="font-mono text-[10px]">{activeProfile.model}</span>
               </div>
             )}
@@ -1298,7 +1191,7 @@ export default function DashboardPage() {
           {pendingCount > 0 && (
             <div className="mt-3">
               <div className="mb-1.5 text-[10px] font-medium text-amber-400">
-                {translate("overview.pendingApprovals", { count: pendingCount })}
+                {t("Pending approvals ({count})", { count: pendingCount })}
               </div>
               <div className="flex flex-col gap-1.5">
                 {pending.slice(0, 3).map((p) => (
@@ -1319,7 +1212,7 @@ export default function DashboardPage() {
                     href="/system/intercept/approvals"
                     className="text-center text-[10px] text-muted-foreground hover:text-foreground"
                   >
-                    {translate("overview.moreApprovals", { count: pendingCount - 3 })}
+                    {t("{count} more…", { count: pendingCount - 3 })}
                   </Link>
                 )}
               </div>
@@ -1329,7 +1222,7 @@ export default function DashboardPage() {
           {pendingCount === 0 && (
             <div className="mt-3 rounded-lg border bg-muted/10 px-3 py-3 text-center text-[10px] text-muted-foreground">
               <ShieldCheckIcon className="mx-auto mb-1 size-4 text-emerald-500/50" />
-              {translate("overview.noPendingApprovals")}
+              {t("No pending interception approvals")}
             </div>
           )}
         </Card>

@@ -1,180 +1,181 @@
 "use client";
+
 import * as React from "react";
 
 import { SearchIcon } from "lucide-react";
 
 import { Input } from "@/components/ui/input";
-import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
+import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 // ── DSL autocomplete ──────────────────────────────────────────────────────────
-// Shared by the global asset view (/function/assets) and the per-task 测试资产
+// Shared by the global asset view (/function/assets) and the per-task test assets
 // search, so both search boxes behave and look identical.
 
-const DSL_FIELDS = (ui: UITranslate): { name: string; desc: string; ops: { op: string; desc: string }[] }[] => [
+const DSL_FIELDS: { name: string; desc: string; ops: { op: string; desc: string }[] }[] = [
   {
     name: "domain",
-    desc: ui("screen.57099007fa308d"),
+    desc: t("Domain (root domain/subdomain/service domain)"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "ip",
-    desc: ui("screen.d6bccb5525b543"),
+    desc: t("IPv4/IPv6 address"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "url",
-    desc: ui("screen.3e78ecd2c1c29e"),
+    desc: t("Full URL (service/endpoint)"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "root_domain",
-    desc: ui("screen.bc208f697acff9"),
+    desc: t("Root domain"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "page_title",
-    desc: ui("screen.69e532a0a63349"),
+    desc: t("Page title (HTTP service)"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "icp",
-    desc: ui("screen.94a539470270db"),
+    desc: t("ICP filing number"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "service_name",
-    desc: ui("screen.c481d537b52090"),
+    desc: t("Service name (non-HTTP service)"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "app_name",
-    desc: ui("screen.e4569e38b854a1"),
+    desc: t("App name"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "bundle_id",
-    desc: ui("screen.40a99c183eef6d"),
+    desc: t("App Bundle ID"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "category",
-    desc: ui("screen.5315ee8353ac3f"),
+    desc: t("App category"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "app_icp",
-    desc: ui("screen.1482fa61ead67e"),
+    desc: t("App ICP filing"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "method",
-    desc: ui("screen.6b3e518f24ef15"),
+    desc: t("HTTP method GET/POST/PUT/…"),
     ops: [
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "service_type",
-    desc: ui("screen.6fa8aac3e7f6dc"),
+    desc: t("Service type: http | other"),
     ops: [
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "record_type",
-    desc: ui("screen.98614bf0dfd16e"),
+    desc: t("DNS record type A/CNAME/MX/…"),
     ops: [
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "technology",
-    desc: ui("screen.cf68ad2b6bffb4"),
+    desc: t("Technology fingerprint (array field)"),
     ops: [
-      { op: "=", desc: ui("screen.11d3fca99fc591") },
-      { op: "==", desc: ui("screen.391fe725d014c9") },
-      { op: "!=", desc: ui("screen.ac83d3972fe9fd") },
+      { op: "=", desc: t("fuzzy match") },
+      { op: "==", desc: t("exact match") },
+      { op: "!=", desc: t("exclude") },
     ],
   },
   {
     name: "port",
-    desc: ui("screen.b54804697609f5"),
+    desc: t("Port number (integer)"),
     ops: [
-      { op: "==", desc: ui("screen.4bc69a0562ff8e") },
-      { op: "!=", desc: ui("screen.9678e3a7cb3c9c") },
-      { op: ">", desc: ui("screen.b4614ab230a531") },
-      { op: ">=", desc: ui("screen.e1feef07d1b87b") },
-      { op: "<", desc: ui("screen.a39accd3595fa6") },
-      { op: "<=", desc: ui("screen.035d78382d6fae") },
+      { op: "==", desc: t("equals") },
+      { op: "!=", desc: t("not equals") },
+      { op: ">", desc: t("greater than") },
+      { op: ">=", desc: t("greater than or equal") },
+      { op: "<", desc: t("less than") },
+      { op: "<=", desc: t("less than or equal") },
     ],
   },
   {
     name: "status_code",
-    desc: ui("screen.b4d43dea84773f"),
+    desc: t("HTTP status code (integer)"),
     ops: [
-      { op: "==", desc: ui("screen.4bc69a0562ff8e") },
-      { op: "!=", desc: ui("screen.9678e3a7cb3c9c") },
-      { op: ">", desc: ui("screen.b4614ab230a531") },
-      { op: ">=", desc: ui("screen.e1feef07d1b87b") },
-      { op: "<", desc: ui("screen.a39accd3595fa6") },
-      { op: "<=", desc: ui("screen.035d78382d6fae") },
+      { op: "==", desc: t("equals") },
+      { op: "!=", desc: t("not equals") },
+      { op: ">", desc: t("greater than") },
+      { op: ">=", desc: t("greater than or equal") },
+      { op: "<", desc: t("less than") },
+      { op: "<=", desc: t("less than or equal") },
     ],
   },
-  { name: "company_id", desc: ui("screen.ddf430978fe51e"), ops: [{ op: "==", desc: ui("screen.4bc69a0562ff8e") }] },
-  { name: "task_id", desc: ui("screen.e64f0ccf4690d2"), ops: [{ op: "==", desc: ui("screen.4bc69a0562ff8e") }] },
+  { name: "company_id", desc: t("Owning company ID (integer)"), ops: [{ op: "==", desc: t("equals") }] },
+  { name: "task_id", desc: t("Source task ID (integer)"), ops: [{ op: "==", desc: t("equals") }] },
 ];
 
-const LOGIC_OPS = (ui: UITranslate) => [
-  { label: "AND", desc: ui("screen.c68c81f1b693b1") },
-  { label: "OR", desc: ui("screen.6a5ea76d398f8b") },
+const LOGIC_OPS = [
+  { label: "AND", desc: t("AND (both conditions must match)") },
+  { label: "OR", desc: t("OR (either one matches)") },
 ];
 
 interface DslSuggestion {
@@ -186,7 +187,7 @@ interface DslSuggestion {
   insertText: string;
 }
 
-function getDslSuggestions(text: string, cursor: number, ui: UITranslate): DslSuggestion[] {
+function getDslSuggestions(text: string, cursor: number): DslSuggestion[] {
   const before = text.slice(0, cursor);
   // Current token: non-whitespace, non-paren run ending at cursor
   const tokenMatch = before.match(/([^\s()]*$)/);
@@ -197,7 +198,7 @@ function getDslSuggestions(text: string, cursor: number, ui: UITranslate): DslSu
   if (/^[a-z_]+(==|!=|>=|<=|=|>|<)/.test(currentToken)) return [];
 
   // Complete known field name → suggest operators for that field
-  const exactField = DSL_FIELDS(ui).find((f) => f.name === currentToken.toLowerCase());
+  const exactField = DSL_FIELDS.find((f) => f.name === currentToken.toLowerCase());
   if (exactField) {
     return exactField.ops.map(({ op, desc }) => ({
       kind: "operator",
@@ -215,21 +216,19 @@ function getDslSuggestions(text: string, cursor: number, ui: UITranslate): DslSu
 
   // Current token is a prefix of AND/OR and follows a complete expression
   if (/^(a|an|and|o|or)$/i.test(currentToken) && afterExpression) {
-    return LOGIC_OPS(ui)
-      .filter((l) => l.label.startsWith(currentToken.toUpperCase()))
-      .map(({ label, desc }) => ({
-        kind: "logic",
-        label,
-        desc,
-        replaceStart: tokenStart,
-        replaceEnd: cursor,
-        insertText: `${label} `,
-      }));
+    return LOGIC_OPS.filter((l) => l.label.startsWith(currentToken.toUpperCase())).map(({ label, desc }) => ({
+      kind: "logic",
+      label,
+      desc,
+      replaceStart: tokenStart,
+      replaceEnd: cursor,
+      insertText: `${label} `,
+    }));
   }
 
   // No current token, after a complete expression → suggest AND/OR
   if (!currentToken && afterExpression) {
-    return LOGIC_OPS(ui).map(({ label, desc }) => ({
+    return LOGIC_OPS.map(({ label, desc }) => ({
       kind: "logic",
       label,
       desc,
@@ -241,16 +240,14 @@ function getDslSuggestions(text: string, cursor: number, ui: UITranslate): DslSu
 
   // Default: suggest fields filtered by prefix
   const prefix = currentToken.toLowerCase();
-  return DSL_FIELDS(ui)
-    .filter((f) => f.name.startsWith(prefix))
-    .map((f) => ({
-      kind: "field",
-      label: f.name,
-      desc: f.desc,
-      replaceStart: tokenStart,
-      replaceEnd: cursor,
-      insertText: f.name,
-    }));
+  return DSL_FIELDS.filter((f) => f.name.startsWith(prefix)).map((f) => ({
+    kind: "field",
+    label: f.name,
+    desc: f.desc,
+    replaceStart: tokenStart,
+    replaceEnd: cursor,
+    insertText: f.name,
+  }));
 }
 
 function applyDslSuggestion(text: string, s: DslSuggestion): { text: string; cursor: number } {
@@ -265,7 +262,7 @@ const KIND_STYLE: Record<string, string> = {
 };
 
 // AssetDslSearch is the shared DSL search box: a monospace input with a
-// field/operator/logic autocomplete popover and a status line ("找到 N 条" /
+// field/operator/logic autocomplete popover and a status line ("found N" /
 // error / loading). Used by both the global asset view and the per-task view.
 export function AssetDslSearch({
   query,
@@ -280,22 +277,17 @@ export function AssetDslSearch({
   error: string;
   count?: number;
 }) {
-  const { ui, liveUI } = useUITranslation();
-
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [suggestions, setSuggestions] = React.useState<DslSuggestion[]>([]);
   const [selIdx, setSelIdx] = React.useState(0);
   const [open, setOpen] = React.useState(false);
 
-  const refresh = React.useCallback(
-    (val: string, pos: number) => {
-      const suggs = getDslSuggestions(val, pos, liveUI);
-      setSuggestions(suggs);
-      setSelIdx(0);
-      setOpen(suggs.length > 0);
-    },
-    [liveUI],
-  );
+  const refresh = React.useCallback((val: string, pos: number) => {
+    const suggs = getDslSuggestions(val, pos);
+    setSuggestions(suggs);
+    setSelIdx(0);
+    setOpen(suggs.length > 0);
+  }, []);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
@@ -350,7 +342,7 @@ export function AssetDslSearch({
         <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           ref={inputRef}
-          placeholder={ui("screen.987bc11337be5a")}
+          placeholder={t("DSL search: {example}", { example: "domain=example AND status_code>=400" })}
           value={query}
           onChange={handleChange}
           onKeyDown={handleKeyDown}
@@ -385,11 +377,11 @@ export function AssetDslSearch({
       {query.trim() && !open && (
         <p className="pl-1 text-[11px] text-muted-foreground">
           {loading ? (
-            ui("screen.cc50237edca27e")
+            t("Searching…")
           ) : error ? (
             <span className="text-destructive">{error}</span>
           ) : (
-            ui("screen.1c84e7ce3e9eb5", { v0: count ?? 0 })
+            t("Found {count}", { count: count ?? 0 })
           )}
         </p>
       )}

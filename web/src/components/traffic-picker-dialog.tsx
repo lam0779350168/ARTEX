@@ -1,4 +1,5 @@
 "use client";
+
 import * as React from "react";
 
 import { toast } from "sonner";
@@ -20,9 +21,9 @@ import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { FindingTrafficBinding, TrafficResp } from "@/lib/types";
+import { intlLocale, t } from "@/i18n";
 
 const METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 
@@ -39,8 +40,6 @@ export function TrafficPickerDialog({
   onClose: () => void;
   onBound: () => void;
 }) {
-  const { ui } = useUITranslation();
-
   const [host, setHost] = React.useState("");
   const [method, setMethod] = React.useState("all");
   const [query, setQuery] = React.useState("");
@@ -94,7 +93,7 @@ export function TrafficPickerDialog({
         [...selected].map((traffic_id) => ({ traffic_id })),
         contextTask,
       );
-      toast.success(ui("screen.f48eac37dfd261", { v0: selected.size }));
+      toast.success(t("Bound {count} traffic records", { count: selected.size }));
       onBound();
       onClose();
     } catch (e) {
@@ -114,16 +113,18 @@ export function TrafficPickerDialog({
       >
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-5xl">
           <DialogHeader>
-            <DialogTitle>{ui("screen.1d0dd2ccf47064")}</DialogTitle>
-            <DialogDescription>{ui("screen.a6fdb2e564dfe8")}</DialogDescription>
+            <DialogTitle>{t("Bind traffic")}</DialogTitle>
+            <DialogDescription>
+              {t("Filter and multi-select requests/responses; selections persist across pages. After binding you can set purpose, notes, and order.")}
+            </DialogDescription>
           </DialogHeader>
           <FieldGroup className="flex flex-col gap-3 sm:flex-row">
             <Field>
-              <FieldLabel htmlFor="evidence-host">{ui("screen.31b163188551bf")}</FieldLabel>
+              <FieldLabel htmlFor="evidence-host">{t("Target host")}</FieldLabel>
               <Input
                 id="evidence-host"
                 value={host}
-                placeholder={ui("screen.9de86a249f6972")}
+                placeholder={t("Domain or IP")}
                 onChange={(e) => {
                   setHost(e.target.value);
                   setPage(0);
@@ -131,7 +132,7 @@ export function TrafficPickerDialog({
               />
             </Field>
             <Field>
-              <FieldLabel htmlFor="evidence-method">{ui("screen.cf206666a6a53a")}</FieldLabel>
+              <FieldLabel htmlFor="evidence-method">{t("Request method")}</FieldLabel>
               <Select
                 value={method}
                 onValueChange={(v) => {
@@ -144,7 +145,7 @@ export function TrafficPickerDialog({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value="all">{ui("screen.470f9e522dbc29")}</SelectItem>
+                    <SelectItem value="all">{t("All methods")}</SelectItem>
                     {METHODS.map((m) => (
                       <SelectItem key={m} value={m}>
                         {m}
@@ -155,11 +156,11 @@ export function TrafficPickerDialog({
               </Select>
             </Field>
             <Field>
-              <FieldLabel htmlFor="evidence-query">{ui("screen.1f7f0db90f932d")}</FieldLabel>
+              <FieldLabel htmlFor="evidence-query">{t("Keyword")}</FieldLabel>
               <Input
                 id="evidence-query"
                 value={query}
-                placeholder={ui("screen.027e46dc0fadc9")}
+                placeholder={t("URL / body keyword")}
                 onChange={(e) => {
                   setQuery(e.target.value);
                   setPage(0);
@@ -178,7 +179,7 @@ export function TrafficPickerDialog({
                 <TableRow>
                   <TableHead>
                     <Checkbox
-                      aria-label={ui("screen.cdb7c4afc7b53a")}
+                      aria-label={t("Select unbound traffic on this page")}
                       disabled={loading || busy || selectable.length === 0}
                       checked={selectable.length > 0 && selectable.every((e) => selected.has(e.id))}
                       onCheckedChange={(checked) =>
@@ -193,10 +194,10 @@ export function TrafficPickerDialog({
                       }
                     />
                   </TableHead>
-                  <TableHead>{ui("screen.eea931d9f29e2a")}</TableHead>
-                  <TableHead>{ui("screen.8b6ff498515bcc")}</TableHead>
-                  <TableHead>{ui("screen.06f7d73412128f")}</TableHead>
-                  <TableHead>{ui("screen.ed31fbb483ee1b")}</TableHead>
+                  <TableHead>{t("Method / URL")}</TableHead>
+                  <TableHead>{t("Time")}</TableHead>
+                  <TableHead>{t("Status code")}</TableHead>
+                  <TableHead>{t("Actions")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -204,7 +205,7 @@ export function TrafficPickerDialog({
                   <TableRow key={e.id}>
                     <TableCell>
                       <Checkbox
-                        aria-label={ui("screen.be085904b7f30c", { v0: e.id })}
+                        aria-label={t("Select traffic {id}", { id: e.id })}
                         checked={selected.has(e.id) || alreadyBound.has(e.id)}
                         disabled={busy || loading || alreadyBound.has(e.id)}
                         onCheckedChange={(checked) => toggle(e.id, checked === true)}
@@ -214,15 +215,15 @@ export function TrafficPickerDialog({
                       <span className="font-mono text-xs">
                         {e.method} {e.url}
                       </span>
-                      {alreadyBound.has(e.id) ? <Badge variant="secondary">{ui("screen.f70c0007f30ff7")}</Badge> : null}
+                      {alreadyBound.has(e.id) ? <Badge variant="secondary">{t("Bound")}</Badge> : null}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-xs">
-                      {new Date(e.ts).toLocaleString(ui("screen.91610255157661"))}
+                      {new Date(e.ts).toLocaleString(intlLocale)}
                     </TableCell>
                     <TableCell>{e.status}</TableCell>
                     <TableCell>
                       <Button variant="ghost" size="sm" onClick={() => setPreview(e.id)}>
-                        {ui("screen.13d61fea9f1749")}
+                        {t("Preview")}
                       </Button>
                     </TableCell>
                   </TableRow>
@@ -230,7 +231,7 @@ export function TrafficPickerDialog({
                 {!rows.length ? (
                   <TableRow>
                     <TableCell colSpan={5} className="py-8 text-center">
-                      {loading ? ui("screen.4927a53bcc886a") : ui("screen.be35d64613edd0")}
+                      {loading ? t("Loading…") : t("No matching traffic")}
                     </TableCell>
                   </TableRow>
                 ) : null}
@@ -239,9 +240,7 @@ export function TrafficPickerDialog({
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-sm">
-              {ui("screen.7ecf1cde648680")}
-              {selected.size} {ui("screen.8ed2941e967dd6")}
-              {data?.total ?? 0} {ui("screen.f004f1d84cf962")}
+              {t("{selected} selected · {total} total", { selected: selected.size, total: data?.total ?? 0 })}
             </span>
             <div className="flex items-center gap-2">
               <Button
@@ -250,28 +249,25 @@ export function TrafficPickerDialog({
                 disabled={loading || page === 0}
                 onClick={() => setPage((p) => p - 1)}
               >
-                {ui("screen.c9b9ae7a61444a")}
+                {t("Previous")}
               </Button>
-              <span className="text-xs">
-                {ui("screen.af50a0fe2a50a3")}
-                {page + 1} {ui("screen.d24d3c99460c7e")}
-              </span>
+              <span className="text-xs">{t("Page {page}", { page: page + 1 })}</span>
               <Button
                 variant="outline"
                 size="sm"
                 disabled={loading || (page + 1) * 25 >= (data?.total ?? 0)}
                 onClick={() => setPage((p) => p + 1)}
               >
-                {ui("screen.8a8542f6964852")}
+                {t("Next")}
               </Button>
             </div>
           </div>
           <DialogFooter>
             <Button variant="outline" disabled={busy} onClick={onClose}>
-              {ui("screen.2cd0f3be8738a8")}
+              {t("Cancel")}
             </Button>
             <Button disabled={busy || selected.size === 0} onClick={() => void save()}>
-              {busy ? ui("screen.ff509c9ba052a2") : ui("screen.d1486d5dffa3b0", { v0: selected.size })}
+              {busy ? t("Saving…") : t("Bind {count} traffic records", { count: selected.size })}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -1,4 +1,5 @@
 "use client";
+
 import * as React from "react";
 
 import {
@@ -25,38 +26,51 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
+import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
+import { setVisibleInterval } from "@/lib/polling";
 
-// 思考开关(thinking.type)与思考强度(reasoning_effort)是两个【互相独立】的字段，
-// 各自单独设置——有些接口没有 thinking 字段、只靠强度参数就能激活思考，故需解耦。
-// 存库空字符串 = 该字段【不发送】；Radix Select 不接受空 value，故 UI 用 "none"
-// 哨兵表示不发送，存取时与 "" 互转（NONE / fromStore / toStore）。
+// Renders a translated string, turning <b>…</b> spans into bold elements, so a sentence with emphasis stays one key.
+function rich(s: string): React.ReactNode[] {
+  return s.split(/<b>(.*?)<\/b>/).map((part, i) => (i % 2 === 1 ? <b key={i}>{part}</b> : part));
+}
+
+// The thinking switch (thinking.type) and the thinking effort (reasoning_effort) are two [independent] fields,
+// each set on its own — some APIs have no thinking field and activate thinking via the effort parameter alone, hence the decoupling.
+// An empty string in storage = the field is [not sent]; Radix Select rejects an empty value, so the UI uses "none"
+// as the sentinel for not sent, converted to and from "" on load and save (NONE / fromStore / toStore).
 const NONE = "none";
 const fromStore = (v?: string) => (v ? v : NONE);
 const toStore = (v: string) => (v === NONE ? "" : v);
-const THINKING_TYPES = (ui: UITranslate): { value: string; label: string }[] => [
-  { value: NONE, label: ui("screen.d703a9bcd8b626") },
-  { value: "disabled", label: ui("screen.3fd47edce45b36") },
-  { value: "enabled", label: ui("screen.8da97ddda990e7") },
+const THINKING_TYPES: { value: string; label: string }[] = [
+  { value: NONE, label: t("Not sent (default)") },
+  { value: "disabled", label: t("Disabled") },
+  { value: "enabled", label: t("Enabled") },
 ];
-// 输出上限用哪个请求字段名（仅 openai 格式有意义）。NONE ↔ "" 走同一套哨兵转换。
-const MAX_TOKENS_FIELDS = (ui: UITranslate): { value: string; label: string }[] => [
-  { value: NONE, label: ui("screen.af7202f4ddd9ce") },
+// Which request field name carries the output cap (only meaningful for the openai format). NONE ↔ "" shares the same sentinel conversion.
+const MAX_TOKENS_FIELDS: { value: string; label: string }[] = [
+  { value: NONE, label: t("max_tokens (default)") },
   { value: "max_completion_tokens", label: "max_completion_tokens" },
 ];
-// 另外两种格式各自定死了字段名，选项对它们无意义，说明文案里直接讲清楚。
-const MAX_TOKENS_FIELD_HINTS = (ui: UITranslate): Record<string, string> => ({
-  openai: ui("screen.8565b2d7398535"),
-  anthropic: ui("screen.55138cdb37fe16"),
-  "openai-responses": ui("screen.82b05dbd905574"),
-});
-const EFFORT_LEVELS = (ui: UITranslate): { value: string; label: string }[] => [
-  { value: NONE, label: ui("screen.d703a9bcd8b626") },
+// The other formats hard-code their field names, so the option is meaningless for them; the hint texts spell this out.
+const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
+  openai: t(
+    "Which key carries the cap. max_tokens is the default and the vast majority of compatible gateways only accept it; OpenAI's official reasoning models (the o series / GPT-5) conversely only accept max_completion_tokens and fail outright with unsupported_parameter when they receive max_tokens.",
+  ),
+  anthropic: t("Only selectable for the openai format. Anthropic's field name is fixed as max_tokens."),
+  "openai-responses": t("Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens."),
+  ollama: t("Only selectable for the openai format. Ollama's field name is fixed as max_tokens."),
+};
+// LLM profile formats. The default in the create form is "anthropic"; "ollama" is the
+// keyless local-server format (base URL defaults to http://127.0.0.1:11434/v1).
+type ProfileFormat = "anthropic" | "openai" | "openai-responses" | "ollama";
+const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1";
+const EFFORT_LEVELS: { value: string; label: string }[] = [
+  { value: NONE, label: t("Not sent (default)") },
   { value: "low", label: "low" },
   { value: "medium", label: "medium" },
   { value: "high", label: "high" },
@@ -66,43 +80,41 @@ const EFFORT_LEVELS = (ui: UITranslate): { value: string; label: string }[] => [
 
 function cooldownText(secs: number) {
   if (secs <= 0) return "";
-  if (secs < 60) return `${secs}s`;
-  return `${Math.ceil(secs / 60)}min`;
+  if (secs < 60) return t("{n}s", { n: secs });
+  return t("{n}min", { n: Math.ceil(secs / 60) });
 }
 
-// 一个配置在卡片上显示的「是否正常」。没填 Key 的配置根本发不出请求，比熔断更该先说；
-// 其余状态来自轮询的熔断记录（轮询关着时不会产生新记录，此时「正常」= 没有已知故障）。
+// The "healthy or not" badge a profile shows on its card. A profile without a Key cannot send any request at all — say that before the breaker;
+// the exception is Ollama, a keyless local server that IS callable without a key. The other states come from the pool's breaker
+// records (with polling off no new records appear, so "healthy" = no known failure).
 type Health = { label: string; cls: string; hint?: string };
-function healthOf(p: LLMProfile, m: LLMPoolMember | undefined, ui: UITranslate): Health {
-  if (!p.api_key_hint) {
+function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
+  if (!p.api_key_hint && p.format !== "ollama") {
     return {
-      label: ui("screen.3c87680f913852"),
+      label: t("No Key configured"),
       cls: "border-muted-foreground/40 text-muted-foreground",
-      hint: ui("screen.2ca6df78a192e6"),
+      hint: t("No API Key set; cannot be called"),
     };
   }
   if (m?.state === "tripped") {
     return {
-      label:
-        m.cooldown_secs > 0
-          ? ui("screen.68c534490c4ad4", { v0: cooldownText(m.cooldown_secs) })
-          : ui("screen.230ae98a62aa44"),
+      label: m.cooldown_secs > 0 ? t("Tripped · {cooldown}", { cooldown: cooldownText(m.cooldown_secs) }) : t("Tripped"),
       cls: "border-destructive/50 text-destructive",
       hint: m.last_error,
     };
   }
   if (m?.state === "degraded") {
     return {
-      label: ui("screen.c00b3a9fb3e0b1", { v0: m.fails }),
+      label: t("Degraded · failed {count} times", { count: m.fails }),
       cls: "border-amber-500/50 text-amber-600 dark:text-amber-400",
       hint: m.last_error,
     };
   }
-  return { label: ui("screen.296de0e31f8c22"), cls: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" };
+  return { label: t("Healthy"), cls: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 轮询配置抽屉
+// Pool settings drawer
 // ─────────────────────────────────────────────────────────────────────────────
 
 function PoolSheet({
@@ -116,15 +128,13 @@ function PoolSheet({
   pool: LLMPoolStatus | null;
   onReload: () => Promise<void>;
 }) {
-  const { ui } = useUITranslation();
-
   const [busy, setBusy] = React.useState(false);
 
-  // 冷却倒计时是后端算出的剩余秒数——抽屉开着且有配置不正常时才定时拉，让它走起来。
+  // The cooldown countdown is the remaining seconds computed by the backend — fetched on a timer only while the drawer is open and some profile is unhealthy, to keep it ticking.
   React.useEffect(() => {
     if (!open || !pool?.enabled || !pool.chain.some((m) => m.state !== "ok")) return;
-    const t = setInterval(() => void onReload(), 10_000);
-    return () => clearInterval(t);
+    const stopPolling = setVisibleInterval(() => void onReload(), 10_000);
+    return stopPolling;
   }, [open, pool, onReload]);
 
   async function toggle(patch: { llm_pool_enabled?: boolean; llm_pool_bind_fallback?: boolean }) {
@@ -134,12 +144,12 @@ function PoolSheet({
       await api.setSettings(patch);
       await onReload();
       if (patch.llm_pool_enabled !== undefined) {
-        toast.success(patch.llm_pool_enabled ? ui("screen.6ad92e056b6315") : ui("screen.d610844e23520e"));
+        toast.success(patch.llm_pool_enabled ? t("LLM pool enabled") : t("LLM pool disabled"));
       } else {
-        toast.success(ui("screen.1bca47356a9bb2"));
+        toast.success(t("Fallback settings updated"));
       }
     } catch (e) {
-      toast.error(ui("screen.f2270e97e1dbe8", { v0: (e as Error).message }));
+      toast.error(t("Failed to apply settings: {error}", { error: (e as Error).message }));
     } finally {
       setBusy(false);
     }
@@ -149,15 +159,15 @@ function PoolSheet({
     try {
       await api.resetLLMPool(id);
       await onReload();
-      toast.success(id ? ui("screen.e8f2d98a9307ed") : ui("screen.462e8191ab7472"));
+      toast.success(id ? t("Profile recovered") : t("All profiles recovered"));
     } catch (e) {
-      toast.error(ui("screen.b50e3ec91f5284", { v0: (e as Error).message }));
+      toast.error(t("Recovery failed: {error}", { error: (e as Error).message }));
     }
   }
 
   const enabled = pool?.enabled ?? false;
   const chain = pool?.chain ?? [];
-  // 参与轮询的成员（排除被标记「不参与轮询」的），顺序即后端实际的尝试顺序。
+  // Members taking part in the pool (excluding those flagged "excluded from pool"), in the exact order the backend tries them.
   const inChain = chain.filter((m) => m.active || !m.excluded);
   const tripped = chain.filter((m) => m.state === "tripped");
 
@@ -166,26 +176,28 @@ function PoolSheet({
       <SheetContent side="right" className="flex flex-col gap-0 p-0 data-[side=right]:sm:max-w-lg">
         <SheetHeader className="px-4">
           <SheetTitle className="flex items-center gap-2">
-            <ZapIcon className="size-4" /> {ui("screen.ee0d6c3483126c")}
+            <ZapIcon className="size-4" /> {t("LLM Pool · Failover")}
           </SheetTitle>
           <SheetDescription>
-            {ui("screen.74040e7db47c5f")}
-            <b>{ui("screen.2a26d0dfb00d18")}</b>
-            {ui("screen.5d7d896c053816")}
+            {rich(
+              t(
+                "When enabled, an Agent <b>without a pinned model</b> automatically fails over to the next config when the current one is unusable (insufficient balance / dead Key / rate limiting / service error).",
+              ),
+            )}
           </SheetDescription>
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-6">
           <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
             <div className="grid gap-0.5">
-              <Label className="text-sm">{ui("screen.dc35671c955127")}</Label>
-              <p className="text-muted-foreground text-xs">{ui("screen.4e7d9533dde487")}</p>
+              <Label className="text-sm">{t("Enable pool")}</Label>
+              <p className="text-muted-foreground text-xs">{t("Off by default. When off, only the active profile is ever used and a failure stays a failure.")}</p>
             </div>
             <Switch
               checked={enabled}
               disabled={busy}
               onCheckedChange={(v) => void toggle({ llm_pool_enabled: v })}
-              aria-label={ui("screen.ff0ba9711f9c43")}
+              aria-label={t("LLM pool toggle")}
             />
           </div>
 
@@ -193,14 +205,18 @@ function PoolSheet({
             <>
               <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
                 <div className="grid gap-0.5">
-                  <Label className="text-sm">{ui("screen.55f46803c3cc2e")}</Label>
-                  <p className="text-muted-foreground text-xs">{ui("screen.649a58eb0d3e5e")}</p>
+                  <Label className="text-sm">{t("Also fall back when a pinned config fails")}</Label>
+                  <p className="text-muted-foreground text-xs">
+                    {t(
+                      "Off by default: when an Agent or task pins a config, only that config is used and a failure stays a failure (no silent switch to another model). When enabled, a failing pinned config also falls back to the pool chain below.",
+                    )}
+                  </p>
                 </div>
                 <Switch
                   checked={pool?.bind_fallback ?? false}
                   disabled={busy}
                   onCheckedChange={(v) => void toggle({ llm_pool_bind_fallback: v })}
-                  aria-label={ui("screen.297f6440e9bfc7")}
+                  aria-label={t("Bound-config failure fallback toggle")}
                 />
               </div>
 
@@ -208,17 +224,19 @@ function PoolSheet({
 
               <div className="grid gap-2">
                 <div className="flex items-center justify-between">
-                  <Label className="text-sm">{ui("screen.10377d21cbd87a")}</Label>
+                  <Label className="text-sm">{t("Pool order")}</Label>
                   {tripped.length > 0 && (
                     <Button size="sm" variant="ghost" onClick={() => void recover()}>
-                      <RotateCcwIcon /> {ui("screen.45dc341db3efb2")}
+                      <RotateCcwIcon /> {t("Recover all")}
                     </Button>
                   )}
                 </div>
                 {inChain.length < 2 && (
                   <p className="text-muted-foreground text-xs">
-                    {ui("screen.f009a13b8b7ab0")}
-                    {inChain.length} {ui("screen.0796c6e039a0cb")}
+                    {t(
+                      "Only {count} usable profile(s) right now, so the pool has no effect — at least 2 usable profiles (API Key set, or Ollama) with pool participation are required.",
+                      { count: inChain.length },
+                    )}
                   </p>
                 )}
                 {chain.map((m) => {
@@ -240,21 +258,19 @@ function PoolSheet({
                         <span className="font-medium">{m.name}</span>
                         {m.active && (
                           <Badge variant="outline" className="border-amber-400/50 text-amber-500">
-                            {ui("screen.dd1286c29e9b15")}
+                            {t("Active")}
                           </Badge>
                         )}
-                        {excluded && <Badge variant="outline">{ui("screen.91dc49e5d5ca23")}</Badge>}
+                        {excluded && <Badge variant="outline">{t("Excluded from pool")}</Badge>}
                         <div className="ml-auto flex items-center gap-2">
                           {m.state === "tripped" && m.cooldown_secs > 0 && (
                             <span className="text-muted-foreground text-xs">
-                              {ui("screen.6cac16b3978937")}
-                              {cooldownText(m.cooldown_secs)}
+                              {t("Cooldown {time}", { time: cooldownText(m.cooldown_secs) })}
                             </span>
                           )}
                           {m.state === "degraded" && (
                             <span className="text-muted-foreground text-xs">
-                              {ui("screen.22f09c41b5a958")}
-                              {m.fails} {ui("screen.172fb7e67b9b09")}
+                              {t("{count} consecutive failures", { count: m.fails })}
                             </span>
                           )}
                           {m.state !== "ok" && (
@@ -262,8 +278,8 @@ function PoolSheet({
                               size="icon"
                               variant="ghost"
                               className="size-7"
-                              aria-label={ui("screen.904310a2a27a38")}
-                              title={ui("screen.73fe1d255e3c1b")}
+                              aria-label={t("Recover now")}
+                              title={t("Recover now: clears the breaker so the next call retries this profile")}
                               onClick={() => void recover(m.profile_id)}
                             >
                               <RotateCcwIcon className="size-3.5" />
@@ -273,12 +289,7 @@ function PoolSheet({
                       </div>
                       <div className="flex flex-wrap items-center gap-x-3 pl-7 text-muted-foreground text-xs">
                         <code className="truncate font-mono">{m.model}</code>
-                        {!m.active && (
-                          <span>
-                            {ui("screen.565d64601d4d17")}
-                            {m.priority}
-                          </span>
-                        )}
+                        {!m.active && <span>{t("Priority {priority}", { priority: m.priority })}</span>}
                       </div>
                       {m.last_error && (
                         <p className="truncate pl-7 font-mono text-muted-foreground text-xs" title={m.last_error}>
@@ -290,13 +301,15 @@ function PoolSheet({
                 })}
                 {chain.length === 0 && (
                   <div className="rounded-lg border border-dashed p-4 text-center text-muted-foreground text-sm">
-                    {ui("screen.038591ac8878c5")}
+                    {t("No profiles yet")}
                   </div>
                 )}
               </div>
 
               <div className="rounded-lg border border-dashed p-3 text-muted-foreground text-xs leading-relaxed">
-                {ui("screen.10dc4f02ad4731")}
+                {t(
+                  "The active profile is always first; the rest follow priority from high to low (set per profile). After a failure a profile enters a cooldown (60s → 5min → 30min), is skipped while cooling down, and switches back automatically once recovered. Profiles whose context window cannot fit the current request are skipped. Agents and tasks with a pinned model do not join the pool by default.",
+                )}
               </div>
             </>
           )}
@@ -307,7 +320,7 @@ function PoolSheet({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 模型配置抽屉（新建 / 编辑共用同一套表单）
+// Model profile drawer (create / edit share the same form)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ProfileSheet({
@@ -316,16 +329,14 @@ function ProfileSheet({
   onOpenChange,
   onSaved,
 }: {
-  profile: LLMProfile | null; // null = 新建
+  profile: LLMProfile | null; // null = create
   open: boolean;
   onOpenChange: (o: boolean) => void;
   onSaved: (id: string) => void;
 }) {
-  const { ui } = useUITranslation();
-
   const isNew = !profile;
   const [name, setName] = React.useState("");
-  const [format, setFormat] = React.useState<"anthropic" | "openai" | "openai-responses" | "jev">("anthropic");
+  const [format, setFormat] = React.useState<ProfileFormat>("anthropic");
   const [model, setModel] = React.useState("");
   const [baseUrl, setBaseUrl] = React.useState("");
   const [proxy, setProxy] = React.useState("");
@@ -333,33 +344,35 @@ function ProfileSheet({
   const [keyHint, setKeyHint] = React.useState("");
   const [rps, setRps] = React.useState("0");
   const [rpm, setRpm] = React.useState("0");
-  const [cw, setCw] = React.useState("0"); // 上下文窗口(K tokens);0=默认200K
+  const [cw, setCw] = React.useState("0"); // context window (K tokens); 0 = default 200K
   const [thinkingType, setThinkingType] = React.useState(NONE);
   const [effort, setEffort] = React.useState(NONE);
-  const [priority, setPriority] = React.useState("0"); // 轮询顺位;越大越先
+  const [priority, setPriority] = React.useState("0"); // pool order; higher = tried earlier
   const [poolExclude, setPoolExclude] = React.useState(false);
-  const [streaming, setStreaming] = React.useState(true); // true=流式(默认);false=非流式
-  const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
-  const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
-  const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
-  const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
+  const [streaming, setStreaming] = React.useState(true); // true = streaming (default); false = non-streaming
+  const [maxTokens, setMaxTokens] = React.useState("0"); // per-reply output cap; 0 = not sent
+  const [maxTokensField, setMaxTokensField] = React.useState(NONE); // which field name carries the cap; NONE = max_tokens
+  const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // custom session header name; empty = not sent
+  const [userAgent, setUserAgent] = React.useState(""); // custom User-Agent; empty = keep the default UA
+  const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // retry override for this profile; all 0 = follow the global
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [models, setModels] = React.useState<string[]>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [modelQuery, setModelQuery] = React.useState(""); // filter text for the loaded model list; reset on open/close
 
-  // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
-  // 就是一次干净的开始，不会留下上一个配置的残影。
+  // Every time it opens, the form is re-filled from the passed-in profile (reset to defaults when creating). Closing and reopening
+  // the drawer is a clean start, leaving no leftovers from the previous profile.
   React.useEffect(() => {
     if (!open) return;
     setName(profile?.name ?? "");
     setFormat(
-      profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "jev"
+      profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "ollama"
         ? profile.format
         : "anthropic",
     );
-    setModel(profile?.model ?? (profile?.format === "jev" ? "jev-latest" : ""));
+    setModel(profile?.model ?? "");
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
     setRps(String(profile?.rate_per_second ?? 0));
@@ -373,30 +386,41 @@ function ProfileSheet({
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
+    setUserAgent(profile?.user_agent ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
     setModels([]);
     setModelsOpen(false);
+    setModelQuery("");
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
+
+  // Case-insensitive substring filter, so a provider prefix ("deepseek/") or a
+  // fragment ("flash") is enough to narrow a 400-entry list.
+  const filteredModels = React.useMemo(() => {
+    const q = modelQuery.trim().toLowerCase();
+    if (!q) return models;
+    return models.filter((m) => m.toLowerCase().includes(q));
+  }, [models, modelQuery]);
 
   async function loadModels() {
     if (loadingModels) return;
     setLoadingModels(true);
     setModels([]);
+    setModelQuery("");
     try {
       const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
         setModelsOpen(true);
-        toast.success(ui("screen.cba1025637836d", { v0: r.models.length }));
+        toast.success(t("Loaded {count} models", { count: r.models.length }));
       } else {
-        toast.error(ui("screen.72346c6155f559", { v0: r.error ?? ui("screen.093bf588b825d2") }));
+        toast.error(t("Failed to load models: {error}", { error: r.error ?? t("no models returned") }));
       }
     } catch (e) {
-      toast.error(ui("screen.bf7c248d779cd7", { v0: (e as Error).message }));
+      toast.error(t("Error loading models: {error}", { error: (e as Error).message }));
     } finally {
       setLoadingModels(false);
     }
@@ -406,8 +430,8 @@ function ProfileSheet({
     if (testing) return;
     setTesting(true);
     try {
-      // 用配置实际会跑的思考参数来测，这样不支持该字段的模型在这里就失败，
-      // 而不是等到跑任务时才炸。传 profile id：Key 输入框留空时用已存的 Key。
+      // Test with the thinking parameters the profile would actually run, so a model that does not support the field fails here,
+      // not when a task is already running. Pass the profile id: with the Key input left empty, the stored Key is used.
       const r = await api.testLLM(
         format,
         model,
@@ -419,15 +443,16 @@ function ProfileSheet({
         profileId,
         streaming,
         sessionHeaderKey.trim(),
+        userAgent.trim(),
       );
-      // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
+      // Show the reply too: only when the model demonstrably spoke is this the same as working inside a session.
       if (r.ok)
-        toast.success(ui("screen.93d5dd1011a40a", { v0: r.latency_ms ?? "?", v1: r.model ?? model }), {
-          description: r.reply ? ui("screen.38982edd7ce6f4", { v0: r.reply }) : undefined,
+        toast.success(t("Connected · {latency}ms · {model}", { latency: r.latency_ms ?? "?", model: r.model ?? model }), {
+          description: r.reply ? t("Reply: {reply}", { reply: r.reply }) : undefined,
         });
-      else toast.error(ui("screen.a94694b2dddf55", { v0: r.error ?? ui("screen.4d8c1c5b428307") }));
+      else toast.error(t("Connection failed: {error}", { error: r.error ?? t("unknown") }));
     } catch (e) {
-      toast.error(ui("screen.51787f607cb79a", { v0: (e as Error).message }));
+      toast.error(t("Test error: {error}", { error: (e as Error).message }));
     } finally {
       setTesting(false);
     }
@@ -435,7 +460,7 @@ function ProfileSheet({
 
   async function save() {
     if (!name.trim() || !model.trim()) {
-      toast.error(ui("screen.423920e9ada105"));
+      toast.error(t("Please fill in a name and a model"));
       return;
     }
     if (saving) return;
@@ -458,21 +483,32 @@ function ProfileSheet({
         pool_exclude: poolExclude,
         streaming,
         max_tokens: Math.max(0, Number(maxTokens) || 0),
-        // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
-        // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
+        // The field-name switch only matters for openai (Chat Completions); every other format falls back to the default,
+        // and the backend re-applies the same normalization; this just keeps the UI from sending contradictory values.
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
+        user_agent: userAgent.trim(),
         retry,
       });
-      if (isNew) toast.success(ui("screen.f829d810ba52c6", { v0: name.trim() }));
-      else toast.success(profile?.is_default ? ui("screen.99d4670a4b1381") : ui("screen.1bd91a7d0c53c9"));
+      if (isNew) toast.success(t('Created: {name} (use "Set as active" on its card to enable it)', { name: name.trim() }));
+      else
+        toast.success(
+          profile?.is_default ? t("Saved; the active profile takes effect immediately, no restart needed") : t("Saved"),
+        );
       onSaved(String(id));
       onOpenChange(false);
     } catch (e) {
-      toast.error(ui("screen.20e1b0f2590bc7", { v0: (e as Error).message }));
+      toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
       setSaving(false);
     }
+  }
+
+  let keyPlaceholder = "sk-…";
+  if (format === "ollama") {
+    keyPlaceholder = t("optional — a local Ollama server runs keyless");
+  } else if (keyHint) {
+    keyPlaceholder = t("Set ({hint}); leave empty to keep it", { hint: keyHint });
   }
 
   return (
@@ -483,63 +519,67 @@ function ProfileSheet({
       >
         <SheetHeader className="px-4">
           <SheetTitle className="flex items-center gap-2">
-            {isNew ? ui("screen.98379af19aac76") : ui("screen.ba67c9a95861d5", { v0: profile?.name })}
+            {isNew ? t("New model profile") : t("Edit: {name}", { name: profile?.name ?? "" })}
             {profile?.is_default && (
               <Badge variant="outline" className="border-amber-400/50 text-amber-500">
-                {ui("screen.4f056f1db6711a")}
+                {t("Active")}
               </Badge>
             )}
           </SheetTitle>
-          <SheetDescription>{isNew ? ui("screen.2b515ad30ad7d6") : ui("screen.ed62b89f2cd7f3")}</SheetDescription>
+          <SheetDescription>
+            {isNew
+              ? t("New profiles are not activated automatically; use 'Set as active' on its card to enable it.")
+              : t("Click save after editing; saving the active profile takes effect immediately for all agents.")}
+          </SheetDescription>
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
-              <Label htmlFor="p-name">{ui("screen.d44e9b3d3b31d3")}</Label>
+              <Label htmlFor="p-name">{t("Name")}</Label>
               <Input
                 id="p-name"
-                placeholder={ui("screen.a6bf40aad8ffb3")}
+                placeholder={t("e.g. OpenAI production")}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
             </div>
             <div className="grid gap-2">
-              <Label>{ui("screen.0e8b1c78c5f335")}</Label>
-              <Select
-                value={format}
-                onValueChange={(v) => {
-                  const next = v as "anthropic" | "openai" | "openai-responses" | "jev";
-                  setFormat(next);
-                  if (next === "jev" && !model.trim()) setModel("jev-latest");
-                }}
-              >
+              <Label>{t("Format")}</Label>
+              <Select value={format} onValueChange={(v) => setFormat(v as ProfileFormat)}>
                 <SelectTrigger>
-                  <SelectValue placeholder={ui("screen.8a9eac0ac485ca")} />
+                  <SelectValue placeholder={t("Select a format")} />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="anthropic">Anthropic</SelectItem>
                   <SelectItem value="openai">OpenAI (Chat Completions)</SelectItem>
                   <SelectItem value="openai-responses">OpenAI (Responses API)</SelectItem>
-                  <SelectItem value="jev">{ui("screen.1959e996efa50a")}</SelectItem>
+                  <SelectItem value="ollama">{t("Ollama (local, no key needed)")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-model">{ui("screen.c98e118e0a43f0")}</Label>
+            <Label htmlFor="p-model">{t("Model")}</Label>
             <div className="flex gap-2">
               <Input
                 id="p-model"
                 className="font-mono"
-                placeholder="claude-opus-4-8"
+                placeholder={format === "ollama" ? "llama3.2" : "claude-opus-4-8"}
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
               />
-              {/* modal: 这个 Popover 的内容被 portal 到 <body>，在 Sheet 的滚动锁之外，
-                  不加 modal 时列表能渲染却滚不动。modal 让它自己持有最上层滚动锁。 */}
-              <Popover open={modelsOpen} onOpenChange={setModelsOpen} modal>
+              {/* modal: this Popover's content is portaled to <body>, outside the Sheet's scroll lock,
+                  so without modal the list renders but cannot scroll. modal lets it hold the topmost scroll lock itself. */}
+              <Popover
+                open={modelsOpen}
+                onOpenChange={(o) => {
+                  setModelsOpen(o);
+                  if (!o) setModelQuery("");
+                }}
+                modal
+              >
                 <PopoverTrigger asChild>
                   <Button
                     type="button"
@@ -548,51 +588,64 @@ function ProfileSheet({
                     className="shrink-0"
                     disabled={loadingModels}
                     onClick={loadModels}
-                    title={ui("screen.8df45c6e6154da")}
+                    title={t("Load available models from the API")}
                   >
                     {loadingModels ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
                   </Button>
                 </PopoverTrigger>
                 {models.length > 0 && (
-                  <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
-                    {models.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
-                        onClick={() => {
-                          setModel(m);
-                          setModelsOpen(false);
-                        }}
-                      >
-                        {m}
-                      </button>
-                    ))}
+                  <PopoverContent className="w-80 gap-0 p-0" align="end">
+                    <div className="border-b p-1">
+                      <Input
+                        autoFocus
+                        className="h-8 border-0 shadow-none focus-visible:ring-0 dark:bg-transparent"
+                        placeholder={t("Search {count} models…", { count: models.length })}
+                        value={modelQuery}
+                        onChange={(e) => setModelQuery(e.target.value)}
+                        spellCheck={false}
+                        aria-label={t("Search models")}
+                      />
+                    </div>
+                    <div className="max-h-64 overflow-y-auto overscroll-contain p-1">
+                      {filteredModels.length === 0 ? (
+                        <p className="px-2 py-6 text-center text-muted-foreground text-xs">
+                          {t("No model matches “{query}”", { query: modelQuery.trim() })}
+                        </p>
+                      ) : (
+                        filteredModels.map((m) => (
+                          <button
+                            key={m}
+                            type="button"
+                            className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
+                            onClick={() => {
+                              setModel(m);
+                              setModelsOpen(false);
+                            }}
+                          >
+                            {m}
+                          </button>
+                        ))
+                      )}
+                    </div>
                   </PopoverContent>
                 )}
               </Popover>
             </div>
-            {format === "jev" && (
-              <p className="text-muted-foreground text-xs">
-                {ui("screen.2b226df50885ba")}
-                <code className="font-mono">jev-latest</code>。
-              </p>
-            )}
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-base-url">{ui("screen.d1200d4f462127")}</Label>
+            <Label htmlFor="p-base-url">{t("Base URL (optional)")}</Label>
             <Input
               id="p-base-url"
               className="font-mono"
-              placeholder="https://api.openai.com/v1"
+              placeholder={format === "ollama" ? OLLAMA_DEFAULT_BASE_URL : "https://api.openai.com/v1"}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
             />
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-proxy">{ui("screen.a9b70f38a45cde")}</Label>
+            <Label htmlFor="p-proxy">{t("Proxy (optional)")}</Label>
             <Input
               id="p-proxy"
               className="font-mono"
@@ -600,47 +653,80 @@ function ProfileSheet({
               value={proxy}
               onChange={(e) => setProxy(e.target.value)}
             />
-            <p className="text-muted-foreground text-xs">{ui("screen.e65751b638de61")}</p>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="p-session-header">{ui("screen.8d524f0d5c5951")}</Label>
-            <Input
-              id="p-session-header"
-              className="font-mono"
-              placeholder={ui("screen.61e2ed5f4d43e5")}
-              value={sessionHeaderKey}
-              onChange={(e) => setSessionHeaderKey(e.target.value)}
-            />
             <p className="text-muted-foreground text-xs">
-              {ui("screen.b71d704f632bf3")}
-              <b>{ui("screen.b6b1d20850b049")}</b>
-              {ui("screen.ce053ce3d5ec1a")}
+              {t(
+                "Only outbound LLM requests go through this proxy; http/https/socks5 are supported, optionally with credentials (e.g. socks5://user:pass@host:port — URL-encode the password if it contains special characters). Leave empty for no proxy (direct connection).",
+              )}
             </p>
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-api-key">API Key</Label>
+            <Label htmlFor="p-session-header">{t("Custom session header (optional)")}</Label>
+            <Input
+              id="p-session-header"
+              className="font-mono"
+              placeholder={t("e.g. x-session-id (empty = not sent)")}
+              value={sessionHeaderKey}
+              onChange={(e) => setSessionHeaderKey(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              {rich(
+                t(
+                  "Once a header name is set, every request carries this HTTP header, with the value filled in automatically as the <b>current session's session id</b> (chat sessions like conv-12, workers like exp3-worker-i87). Meant for gateways that do prompt caching / sticky routing on a session-id header; stable across turns of one session, distinct across sessions. Leave empty to not send it.",
+                ),
+              )}
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="p-user-agent">{t("Custom User-Agent (optional)")}</Label>
+            <Input
+              id="p-user-agent"
+              className="font-mono"
+              placeholder={t("e.g. my-app/1.0 (empty = default UA)")}
+              value={userAgent}
+              onChange={(e) => setUserAgent(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              {rich(
+                t(
+                  "Overrides the <b>User-Agent</b> header on every outbound LLM request. Useful for gateways that route or allow-list by User-Agent. Leave empty to keep the default User-Agent unchanged.",
+                ),
+              )}
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="p-api-key">
+              {format === "ollama" ? t("API Key (optional for Ollama)") : "API Key"}
+            </Label>
             <Input
               id="p-api-key"
               type="password"
-              placeholder={keyHint ? ui("screen.d717c6180a8bd7", { v0: keyHint }) : "sk-…"}
+              placeholder={keyPlaceholder}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
+              // A masked field with no autocomplete hint looks like this site's
+              // login password: password managers fill it and Save persists the
+              // wrong secret over the stored key. new-password keeps them out.
+              autoComplete="new-password"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
             />
           </div>
 
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="grid gap-2">
-              <Label htmlFor="p-rps">{ui("screen.5056d3f98eb0a0")}</Label>
+              <Label htmlFor="p-rps">{t("Rate limit per second")}</Label>
               <Input id="p-rps" type="number" min={0} value={rps} onChange={(e) => setRps(e.target.value)} />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="p-rpm">{ui("screen.88748996a5c2b6")}</Label>
+              <Label htmlFor="p-rpm">{t("Rate limit per minute")}</Label>
               <Input id="p-rpm" type="number" min={0} value={rpm} onChange={(e) => setRpm(e.target.value)} />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="p-cw">{ui("screen.cecf4a065e4c78")}</Label>
+              <Label htmlFor="p-cw">{t("Context window (K)")}</Label>
               <Input
                 id="p-cw"
                 type="number"
@@ -652,15 +738,23 @@ function ProfileSheet({
               />
             </div>
           </div>
-          <p className="-mt-2 text-muted-foreground text-xs">{ui("screen.1307d9b7f2242d")}</p>
+          <p className="-mt-2 text-muted-foreground text-xs">
+            {t(
+              "Rate limits of 0 mean unlimited, shared across all agents. The context window is in K (thousand tokens); 0 = the 200K default, capped at 1000 (i.e. 1M). Setting it too high keeps compression from ever triggering.",
+            )}
+          </p>
 
           <div className="grid gap-3 rounded-lg border p-3">
             <div className="flex items-center justify-between gap-4">
               <div className="grid gap-0.5">
                 <Label htmlFor="p-priority" className="text-sm">
-                  {ui("screen.06291dedde05ce")}
+                  {t("Pool priority")}
                 </Label>
-                <p className="text-muted-foreground text-xs">{ui("screen.0f940d8051631f")}</p>
+                <p className="text-muted-foreground text-xs">
+                  {t(
+                    "Higher numbers are picked first; the active profile is always first regardless of this value. Profiles with equal priority take turns leading, spreading quota naturally.",
+                  )}
+                </p>
               </div>
               <Input
                 id="p-priority"
@@ -672,17 +766,25 @@ function ProfileSheet({
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
-                <Label className="text-sm">{ui("screen.91dc49e5d5ca23")}</Label>
-                <p className="text-muted-foreground text-xs">{ui("screen.ea107b0bebccd2")}</p>
+                <Label className="text-sm">{t("Excluded from pool")}</Label>
+                <p className="text-muted-foreground text-xs">
+                  {t(
+                    "When enabled, this profile is never used as a failover target (Agents / tasks can still pin it explicitly). Suited to expensive profiles reserved for one specific Agent that should not be burned through by other agents' failures.",
+                  )}
+                </p>
               </div>
-              <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label={ui("screen.91dc49e5d5ca23")} />
+              <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label={t("Excluded from pool")} />
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
-                <Label className="text-sm">{ui("screen.d018137e5c29ca")}</Label>
-                <p className="text-muted-foreground text-xs">{ui("screen.f390431c7b9d51")}</p>
+                <Label className="text-sm">{t("Streaming output")}</Label>
+                <p className="text-muted-foreground text-xs">
+                  {t(
+                    "On (default) streams over SSE, with live in-flight progress and real-time token counting. Off uses true non-streaming (stream:false, returning the full response in one shot) — a way around gateways with broken SSE implementations (empty frames / dropped thinking-field frames), at the cost of losing live in-flight progress.",
+                  )}
+                </p>
               </div>
-              <Switch checked={streaming} onCheckedChange={setStreaming} aria-label={ui("screen.c65e6c6ea8ca51")} />
+              <Switch checked={streaming} onCheckedChange={setStreaming} aria-label={t("Streaming output")} />
             </div>
           </div>
 
@@ -690,9 +792,13 @@ function ProfileSheet({
             <div className="flex items-center justify-between gap-4">
               <div className="grid gap-0.5">
                 <Label htmlFor="p-max-tokens" className="text-sm">
-                  {ui("screen.8f5eff776ea80b")}
+                  {t("Output cap · max tokens")}
                 </Label>
-                <p className="text-muted-foreground text-xs">{ui("screen.30681a7feec710")}</p>
+                <p className="text-muted-foreground text-xs">
+                  {t(
+                    'How many tokens a single reply may generate at most; sent with every request. 0 (default) = the field is not sent, leaving it to the server default. This is not the same thing as the "context window" above: that is the model\'s total capacity, used only locally to compute the compression threshold. Set it too low and a reasoning model gets truncated mid-thinking, unable to emit even a one-word answer.',
+                  )}
+                </p>
               </div>
               <Input
                 id="p-max-tokens"
@@ -706,8 +812,8 @@ function ProfileSheet({
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
-                <Label className="text-sm">{ui("screen.8928d6ea882585")}</Label>
-                <p className="text-muted-foreground text-xs">{MAX_TOKENS_FIELD_HINTS(ui)[format]}</p>
+                <Label className="text-sm">{t("Cap field name")}</Label>
+                <p className="text-muted-foreground text-xs">{MAX_TOKENS_FIELD_HINTS[format]}</p>
               </div>
               <Select
                 value={format === "openai" ? maxTokensField : NONE}
@@ -718,7 +824,7 @@ function ProfileSheet({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {MAX_TOKENS_FIELDS(ui).map((o) => (
+                  {MAX_TOKENS_FIELDS.map((o) => (
                     <SelectItem key={o.value} value={o.value}>
                       {o.label}
                     </SelectItem>
@@ -731,15 +837,19 @@ function ProfileSheet({
           <div className="grid gap-3 rounded-lg border p-3">
             <div className="flex items-center justify-between gap-4">
               <div className="grid gap-0.5">
-                <Label className="text-sm">{ui("screen.2b3cb23e2fac87")}</Label>
-                <p className="text-muted-foreground text-xs">{ui("screen.3937928bb46ddd")}</p>
+                <Label className="text-sm">{t("Thinking switch · thinking.type")}</Label>
+                <p className="text-muted-foreground text-xs">
+                  {t(
+                    "Controls whether the thinking field is sent. Not sent = the field is omitted (compatible with models like MiniMax that lack support); Disabled = send disabled; Enabled = send enabled. Independent of the effort below.",
+                  )}
+                </p>
               </div>
               <Select value={thinkingType} onValueChange={setThinkingType}>
                 <SelectTrigger className="w-32 shrink-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {THINKING_TYPES(ui).map((o) => (
+                  {THINKING_TYPES.map((o) => (
                     <SelectItem key={o.value} value={o.value}>
                       {o.label}
                     </SelectItem>
@@ -749,15 +859,19 @@ function ProfileSheet({
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
-                <Label className="text-sm">{ui("screen.3357601c368024")}</Label>
-                <p className="text-muted-foreground text-xs">{ui("screen.dcbb23dc9258c8")}</p>
+                <Label className="text-sm">{t("Thinking effort · reasoning_effort")}</Label>
+                <p className="text-muted-foreground text-xs">
+                  {t(
+                    "A separate effort knob (OpenAI reasoning_effort / Anthropic output_config.effort). Some APIs have no thinking field and activate thinking via effort alone, so it can be set on its own without sending the thinking switch.",
+                  )}
+                </p>
               </div>
               <Select value={effort} onValueChange={setEffort}>
                 <SelectTrigger className="w-32 shrink-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {EFFORT_LEVELS(ui).map((o) => (
+                  {EFFORT_LEVELS.map((o) => (
                     <SelectItem key={o.value} value={o.value}>
                       {o.label}
                     </SelectItem>
@@ -773,12 +887,12 @@ function ProfileSheet({
         <div className="flex gap-2 border-t px-4 py-3">
           <Button variant="outline" onClick={testConnection} disabled={testing}>
             {testing ? <Loader2Icon className="animate-spin" /> : <PlugZapIcon />}
-            {testing ? ui("screen.105a9082c346f9") : ui("screen.0a98a48eaaac41")}
+            {testing ? t("Testing…") : t("Test connection")}
           </Button>
           <Button onClick={save} disabled={saving} className="flex-1">
             {saving && <Loader2Icon className="animate-spin" />}
             {!saving && (isNew ? <PlusIcon /> : <SaveIcon />)}
-            {isNew ? ui("screen.50ef2f4cf6a469") : ui("screen.a3030bf8f16dc6")}
+            {isNew ? t("Create") : t("Save")}
           </Button>
         </div>
       </SheetContent>
@@ -789,13 +903,11 @@ function ProfileSheet({
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function LLMPage() {
-  const { ui } = useUITranslation();
-
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [poolOpen, setPoolOpen] = React.useState(false);
-  // 抽屉的开关和内容分开存：关闭时 editing 保持不变，否则关闭动画期间标题会从
-  // 「编辑 X」闪成「新建」。editing = null 表示新建。
+  // The drawer's open flag and its content are stored separately: editing stays put on close, otherwise during the closing animation the title would flash
+  // from "Edit X" to "New". editing = null means create.
   const [editOpen, setEditOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<LLMProfile | null>(null);
   const openEditor = React.useCallback((p: LLMProfile | null) => {
@@ -824,7 +936,7 @@ export default function LLMPage() {
     void load();
   }, [load]);
 
-  // 卡片上的健康徽章按 profile id 取轮询状态。
+  // The health badge on each card reads pool state by profile id.
   const health = React.useMemo(() => {
     const m = new Map<string, LLMPoolMember>();
     for (const c of pool?.chain ?? []) m.set(c.profile_id, c);
@@ -834,24 +946,24 @@ export default function LLMPage() {
   async function activate(id: string, name: string) {
     try {
       await api.activateLLMProfile(id);
-      toast.success(ui("screen.9656bea09ffebb", { v0: name }));
+      toast.success(t("Activated: {name}", { name }));
       await load();
     } catch (e) {
-      toast.error(ui("screen.183c05557317c6", { v0: (e as Error).message }));
+      toast.error(t("Activation failed: {error}", { error: (e as Error).message }));
     }
   }
 
   async function remove(p: LLMProfile) {
     if (p.is_default) {
-      toast.error(ui("screen.0ff5af7ae5d53c"));
+      toast.error(t("Cannot delete the active profile"));
       return;
     }
     try {
       await api.deleteLLMProfile(p.id);
-      toast.success(ui("screen.e196bc4beeeaad", { v0: p.name }));
+      toast.success(t("Deleted: {name}", { name: p.name }));
       await load();
     } catch (e) {
-      toast.error(ui("screen.77dcc9d08e857c", { v0: (e as Error).message }));
+      toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -862,35 +974,39 @@ export default function LLMPage() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="font-semibold text-xl tracking-tight">LLM</h1>
-          <p className="text-muted-foreground text-sm">{ui("screen.2599dbd3765970")}</p>
+          <p className="text-muted-foreground text-sm">
+            {t(
+              "Format / model / rate-limit settings shared by all agents. Click a card to edit it; the starred card is the active profile.",
+            )}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => setPoolOpen(true)}>
-            <ZapIcon /> {ui("screen.a3ae904222e90f")}
+            <ZapIcon /> {t("Pool settings")}
             {poolOn && (
               <Badge variant="outline" className="ml-1 border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
-                {ui("screen.8a4ef3e48e4e8a")}
+                {t("On")}
               </Badge>
             )}
           </Button>
           <Button size="sm" variant="outline" onClick={() => openEditor(null)}>
-            <PlusIcon /> {ui("screen.50ef2f4cf6a469")}
+            <PlusIcon /> {t("Create")}
           </Button>
         </div>
       </div>
 
       <Tabs defaultValue="profiles" className="flex-1">
         <TabsList>
-          <TabsTrigger value="profiles">{ui("screen.8cbcf741e727db")}</TabsTrigger>
-          <TabsTrigger value="retry">{ui("screen.939dba970cbff9")}</TabsTrigger>
+          <TabsTrigger value="profiles">{t("Model profiles")}</TabsTrigger>
+          <TabsTrigger value="retry">{t("Retry & backoff")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="profiles" className="mt-4">
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {profiles.map((p) => {
-              const h = healthOf(p, health.get(p.id), ui);
+              const h = healthOf(p, health.get(p.id));
               return (
-                // biome-ignore lint/a11y/useSemanticElements: 卡片内含自己的操作按钮，用原生 <button> 会造成按钮嵌套（非法 HTML）
+                // biome-ignore lint/a11y/useSemanticElements: the card contains its own action buttons; a native <button> would nest buttons (invalid HTML)
                 <Card
                   key={p.id}
                   role="button"
@@ -918,8 +1034,8 @@ export default function LLMPage() {
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="truncate font-medium text-sm">{p.name}</span>
-                          <Badge variant="outline" className="uppercase">
-                            {p.format === "jev" ? "Jev / System One" : p.format}
+                          <Badge variant="outline" className="uppercase" lang="en">
+                            {p.format}
                           </Badge>
                           <Badge variant="outline" className={cn("ml-auto", h.cls)} title={h.hint}>
                             {h.label}
@@ -932,30 +1048,23 @@ export default function LLMPage() {
                     <div className="flex flex-wrap gap-x-3 gap-y-0.5 pl-6 text-muted-foreground text-xs">
                       {p.api_key_hint && <span>{p.api_key_hint}</span>}
                       <span>
-                        {p.rate_per_second}/s · {p.rate_per_minute}/min
+                        {t("{rps}/s · {rpm}/min", { rps: p.rate_per_second, rpm: p.rate_per_minute })}
                       </span>
-                      {p.proxy && (
-                        <span className="truncate">
-                          {ui("screen.5e84ea61e8386a")}
-                          {p.proxy}
-                        </span>
-                      )}
+                      {p.proxy && <span className="truncate">{t("Proxy {proxy}", { proxy: p.proxy })}</span>}
                       {p.reasoning_effort && (
                         <span>
-                          {ui("screen.8cf0105d35ee8d")}
-                          {p.reasoning_effort === "off" ? ui("screen.5d0ae622f61f8e") : p.reasoning_effort}
+                          {t("Thinking {effort}", {
+                            effort: p.reasoning_effort === "off" ? t("off") : p.reasoning_effort,
+                          })}
                         </span>
                       )}
-                      {/* 轮询相关的两个字段只在轮询开着时才有意义，关着时不占版面 */}
+                      {/* The two pool-related fields only matter when the pool is on; when it is off they take no space */}
                       {poolOn &&
                         !p.is_default &&
                         (p.pool_exclude ? (
-                          <span>{ui("screen.91dc49e5d5ca23")}</span>
+                          <span>{t("Excluded from pool")}</span>
                         ) : (
-                          <span>
-                            {ui("screen.565d64601d4d17")}
-                            {p.priority ?? 0}
-                          </span>
+                          <span>{t("Priority {priority}", { priority: p.priority ?? 0 })}</span>
                         ))}
                     </div>
 
@@ -964,22 +1073,18 @@ export default function LLMPage() {
                         size="sm"
                         variant="outline"
                         className="flex-1"
-                        disabled={p.is_default || p.format === "jev"}
+                        disabled={p.is_default}
                         onClick={(e) => {
                           e.stopPropagation();
                           void activate(p.id, p.name);
                         }}
                       >
-                        {p.is_default
-                          ? ui("screen.8f3c822f08add5")
-                          : p.format === "jev"
-                            ? ui("screen.a50267496fb58e")
-                            : ui("screen.4b670950419567")}
+                        {p.is_default ? t("Active") : t("Set as active")}
                       </Button>
                       <Button
                         size="icon"
                         variant="outline"
-                        aria-label={ui("screen.49b82b04bd1a7d")}
+                        aria-label={t("Delete profile")}
                         onClick={(e) => {
                           e.stopPropagation();
                           void remove(p);
@@ -994,7 +1099,7 @@ export default function LLMPage() {
             })}
             {profiles.length === 0 && (
               <div className="col-span-full rounded-lg border border-dashed p-10 text-center text-muted-foreground text-sm">
-                {ui("screen.39aa348a5b607d")}
+                {t('No model profiles yet — click "Create" in the top right to add the first one.')}
               </div>
             )}
           </div>

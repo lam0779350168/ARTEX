@@ -3,11 +3,11 @@
 import { useEffect, useRef } from "react";
 
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
-import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import { Pagination, PaginationContent, PaginationEllipsis, PaginationItem } from "@/components/ui/pagination";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { t } from "@/i18n";
 
 interface TablePaginationProps {
   page: number; // 1-based
@@ -39,7 +39,6 @@ export function TablePagination({
   onPageSizeChange,
   pageSizeOptions = [10, 20, 50],
 }: TablePaginationProps) {
-  const { t } = useTranslation();
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(Math.max(1, page), totalPages);
   const from = total === 0 ? 0 : (safePage - 1) * pageSize + 1;
@@ -66,11 +65,11 @@ export function TablePagination({
             ))}
           </SelectContent>
         </Select>
-        <span>{t("pagination.perPage")}</span>
+        <span>{t("per page")}</span>
         {total > 0 ? (
-          <span className="tabular-nums">{t("pagination.range", { from, to, total, count: total })}</span>
+          <span className="tabular-nums">{t("{from}–{to} / {total} total", { from, to, total })}</span>
         ) : (
-          <span>{t("pagination.empty")}</span>
+          <span>{t("{total} total", { total: 0 })}</span>
         )}
       </div>
 
@@ -83,7 +82,7 @@ export function TablePagination({
                 size="icon-sm"
                 disabled={safePage === 1}
                 onClick={() => onPageChange(safePage - 1)}
-                aria-label={t("common.previous")}
+                aria-label={t("Previous page")}
               >
                 <ChevronLeftIcon className="size-4" />
               </Button>
@@ -112,7 +111,7 @@ export function TablePagination({
                 size="icon-sm"
                 disabled={safePage === totalPages}
                 onClick={() => onPageChange(safePage + 1)}
-                aria-label={t("common.next")}
+                aria-label={t("Next page")}
               >
                 <ChevronRightIcon className="size-4" />
               </Button>

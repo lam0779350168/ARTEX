@@ -1,15 +1,16 @@
 package server
 
 import (
-	"fmt"
+	"bytes"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
+	"unicode/utf8"
 )
 
 // Workspace file manager — browse / view / edit / download / upload / delete the
@@ -22,23 +23,80 @@ const (
 	maxWorkspaceUpload = 512 << 20 // 512 MiB per upload request
 )
 
-// wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
-// dir. It returns ok=false if the path would escape the root. filepath.Clean on a
-// rooted copy collapses any ".." so nothing can climb above the root.
-func (s *Server) wsResolve(rel string) (string, bool) {
-	base := filepath.Clean(s.m.dir)
-	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
-	clean := filepath.Clean("/" + rel) // e.g. "/a/../../etc" → "/etc" (still rooted at "/")
-	abs := filepath.Clean(filepath.Join(base, clean))
-	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
-		return "", false
+// wsResolveConfined maps a user-supplied relative path to a canonicalized path
+// inside the work dir, resolving symlinks in every component and rejecting any
+// traversal, broken symlink, symlink loop, or target that escapes s.m.dir.
+func (s *Server) wsResolveConfined(rel string) (confinedPath, bool) {
+	cp, err := resolveWithinRoot(s.m.dir, rel, true)
+	if err != nil {
+		return confinedPath{}, false
 	}
-	return abs, true
+	if workspacePathDenied(cp.realRoot, cp.realPath) {
+		return confinedPath{}, false
+	}
+	return cp, true
+}
+
+// workspaceDeniedPrefixes are platform-internal subtrees under the data dir
+// that the workspace file manager must not expose. traffic/_ca holds the
+// capture proxy CA private key; traffic/_index holds the SQLite exchange index;
+// traffic/_blobs holds the captured bodies the index refers to by hash.
+var workspaceDeniedPrefixes = []string{"traffic/_ca", "traffic/_index", "traffic/_blobs"}
+
+// workspacePathDenied reports whether realPath lands in a platform-internal
+// subtree. It compares the canonicalized path relative to the real root, so a
+// symlink alias cannot reach a denied directory. Segments are lower-cased and
+// trailing dots/spaces are trimmed because Windows resolves those spellings to
+// the same directory.
+func workspacePathDenied(realRoot, realPath string) bool {
+	rel, err := filepath.Rel(realRoot, realPath)
+	if err != nil {
+		return true // fail closed
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == ".." || strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, "/") {
+		return true // outside the root: fail closed
+	}
+	segs := strings.Split(rel, "/")
+	for i, seg := range segs {
+		segs[i] = strings.ToLower(strings.TrimRight(seg, ". "))
+	}
+	rel = strings.Join(segs, "/")
+	for _, prefix := range workspaceDeniedPrefixes {
+		if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// workspaceHoldsDenied reports whether a platform-internal subtree lies beneath
+// path, so that removing path would remove it too. Segments are normalised as
+// in workspacePathDenied.
+func workspaceHoldsDenied(realRoot, path string) bool {
+	rel, err := filepath.Rel(realRoot, path)
+	if err != nil {
+		return true // fail closed
+	}
+	segs := strings.Split(filepath.ToSlash(rel), "/")
+	for i, seg := range segs {
+		segs[i] = strings.ToLower(strings.TrimRight(seg, ". "))
+	}
+	rel = strings.Join(segs, "/")
+	for _, prefix := range workspaceDeniedPrefixes {
+		if strings.HasPrefix(prefix, rel+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
 func (s *Server) wsRel(abs string) string {
-	base := filepath.Clean(s.m.dir)
+	base, err := resolveRealRoot(s.m.dir)
+	if err != nil {
+		base = filepath.Clean(s.m.dir)
+	}
 	rel, err := filepath.Rel(base, abs)
 	if err != nil || rel == "." {
 		return ""
@@ -56,23 +114,24 @@ type wsEntry struct {
 
 // GET /api/workspace/list?path=<rel>
 func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	cp, ok := s.wsResolveConfined(r.URL.Query().Get("path"))
 	if !ok {
-		writeErr(w, 400, "非法路径")
+		writeErr(w, 400, "invalid path")
 		return
 	}
+	abs := cp.realPath
 	fi, err := os.Stat(abs)
 	if err != nil {
-		writeErr(w, 404, "路径不存在")
+		writeErr(w, 404, "path does not exist")
 		return
 	}
 	if !fi.IsDir() {
-		writeErr(w, 400, "不是目录")
+		writeErr(w, 400, "not a directory")
 		return
 	}
 	ents, err := os.ReadDir(abs)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	out := make([]wsEntry, 0, len(ents))
@@ -89,7 +148,7 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 			MTime: info.ModTime().UnixMilli(),
 		})
 	}
-	// 目录在前，各自按名称排序。
+	// Directories first, each sorted by name.
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Dir != out[j].Dir {
 			return out[i].Dir
@@ -102,27 +161,35 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 // GET /api/workspace/read?path=<rel> — inline text for view/edit. Binary or oversize
 // files return {binary:true}/{too_large:true} with no content (use download instead).
 func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	cp, ok := s.wsResolveConfined(r.URL.Query().Get("path"))
 	if !ok {
-		writeErr(w, 400, "非法路径")
+		writeErr(w, 400, "invalid path")
 		return
 	}
+	abs := cp.realPath
 	fi, err := os.Stat(abs)
 	if err != nil {
-		writeErr(w, 404, "文件不存在")
+		writeErr(w, 404, "file does not exist")
 		return
 	}
 	if fi.IsDir() {
-		writeErr(w, 400, "是目录，不能作为文件读取")
+		writeErr(w, 400, "is a directory, cannot be read as a file")
 		return
 	}
-	f, err := os.Open(abs)
+	if fi.Size() > maxWorkspaceRead {
+		writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "size": fi.Size(), "too_large": true, "binary": true})
+		return
+	}
+	data, err := os.ReadFile(abs)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
-	defer f.Close()
-	writeTextFile(w, s.wsRel(abs), f, fi.Size())
+	if bytes.IndexByte(data, 0) >= 0 || !utf8.Valid(data) {
+		writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "size": fi.Size(), "binary": true})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "size": fi.Size(), "binary": false, "content": string(data)})
 }
 
 // POST /api/workspace/write  {path, content} — create/overwrite a text file.
@@ -131,25 +198,26 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	abs, ok := s.wsResolve(req.Path)
-	if !ok || abs == filepath.Clean(s.m.dir) {
-		writeErr(w, 400, "非法路径")
+	cp, ok := s.wsResolveConfined(req.Path)
+	if !ok || cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
 		return
 	}
+	abs := cp.realPath
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
-		writeErr(w, 400, "目标是目录")
+		writeErr(w, 400, "target is a directory")
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	if err := os.WriteFile(abs, []byte(req.Content), 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
@@ -160,17 +228,18 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
 	}
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	abs, ok := s.wsResolve(req.Path)
-	if !ok || abs == filepath.Clean(s.m.dir) {
-		writeErr(w, 400, "非法路径")
+	cp, ok := s.wsResolveConfined(req.Path)
+	if !ok || cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
 		return
 	}
+	abs := cp.realPath
 	if err := os.MkdirAll(abs, 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
@@ -179,21 +248,27 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/workspace/delete?path=<rel> — removes a file or a directory tree
 // (confined to the work dir; the root itself can't be deleted).
 func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	cp, ok := s.wsResolveConfined(r.URL.Query().Get("path"))
 	if !ok {
-		writeErr(w, 400, "非法路径")
+		writeErr(w, 400, "invalid path")
 		return
 	}
-	if abs == filepath.Clean(s.m.dir) {
-		writeErr(w, 400, "不能删除工作区根目录")
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "cannot delete the workspace root directory")
 		return
 	}
-	if _, err := os.Stat(abs); err != nil {
-		writeErr(w, 404, "路径不存在")
+	// entryPath is what RemoveAll removes: a symlink is removed as a link, a
+	// directory with everything beneath it.
+	if workspaceHoldsDenied(cp.realRoot, cp.entryPath) {
+		writeErr(w, 400, "cannot delete a directory that holds platform data (the capture CA, index and blob store)")
 		return
 	}
-	if err := os.RemoveAll(abs); err != nil {
-		writeErr(w, 500, err.Error())
+	if !cp.exists {
+		writeErr(w, 404, "path does not exist")
+		return
+	}
+	if err := os.RemoveAll(cp.entryPath); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -201,199 +276,62 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/workspace/download?path=<rel> — stream a file as an attachment.
 func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	cp, ok := s.wsResolveConfined(r.URL.Query().Get("path"))
 	if !ok {
-		writeErr(w, 400, "非法路径")
+		writeErr(w, 400, "invalid path")
 		return
 	}
+	abs := cp.realPath
 	fi, err := os.Stat(abs)
 	if err != nil || fi.IsDir() {
-		writeErr(w, 404, "文件不存在")
+		writeErr(w, 404, "file does not exist")
 		return
 	}
-	name := filepath.Base(abs)
+	name := filepath.Base(cp.entryPath)
 	// RFC 5987 filename* keeps non-ASCII names intact; plain filename is the fallback.
-	setFileDisposition(w, "attachment", name)
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+sanitizeFilename(name)+"\"; filename*=UTF-8''"+url.PathEscape(name))
 	http.ServeFile(w, r, abs)
-}
-
-// GET /api/workspace/preview?path=<rel> — serve an image inline for report
-// Markdown. Unlike download, this uses an inline content disposition so a
-// report can render a saved browser screenshot with a normal Markdown image URL.
-func (s *Server) wsPreview(w http.ResponseWriter, r *http.Request) {
-	rawPath := strings.TrimSpace(r.URL.Query().Get("path"))
-	abs, ok := s.wsResolve(rawPath)
-	if filepath.IsAbs(rawPath) {
-		base := filepath.Clean(s.m.dir)
-		candidate := filepath.Clean(rawPath)
-		ok = candidate == base || strings.HasPrefix(candidate, base+string(os.PathSeparator))
-		if ok {
-			abs = candidate
-		}
-	}
-	if !ok {
-		writeErr(w, 400, "非法路径")
-		return
-	}
-	fi, err := os.Stat(abs)
-	// Reports use the workspace-relative canonical path
-	// findings/screenshots/finding-<node>-step-<n>.png, while the files live
-	// under the per-conversation session directory. Resolve that exact suffix
-	// in the newest matching session so the links stay portable across reports.
-	if (err != nil || fi.IsDir()) && !filepath.IsAbs(rawPath) {
-		if fallback, found := s.findSessionPreview(rawPath); found {
-			abs = fallback
-			fi, err = os.Stat(abs)
-		}
-	}
-	if err != nil || fi.IsDir() {
-		writeErr(w, 404, "文件不存在")
-		return
-	}
-	ext := strings.ToLower(filepath.Ext(abs))
-	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".gif" {
-		writeErr(w, 415, "仅支持图片预览")
-		return
-	}
-	if s.m.pg.GetBool(settingScreenshotTimestamp, false) {
-		rawRel := filepath.ToSlash(strings.TrimPrefix(strings.TrimSpace(rawPath), "/"))
-		rel := filepath.ToSlash(s.wsRel(abs))
-		if strings.HasPrefix(rawRel, "findings/screenshots/") || strings.HasPrefix(rel, "findings/screenshots/") || strings.Contains(rel, "/findings/screenshots/") {
-			// The frontend renders this as a small top-right overlay. Use the
-			// file mtime so the label reflects capture/save time, not view time.
-			// Containers may run with UTC even when the host is configured for
-			// China Standard Time, so make the report display zone explicit.
-			w.Header().Set("X-Report-Screenshot-Timestamp", reportScreenshotTimestamp(fi.ModTime()))
-		}
-	}
-	w.Header().Set("Content-Disposition", "inline; filename=\""+sanitizeFilename(filepath.Base(abs))+"\"")
-	http.ServeFile(w, r, abs)
-}
-
-func reportScreenshotTimestamp(t time.Time) string {
-	return t.In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02 15:04:05")
-}
-
-func (s *Server) findSessionPreview(rawPath string) (string, bool) {
-	rel := filepath.Clean(strings.TrimPrefix(strings.TrimSpace(rawPath), "/"))
-	const prefix = "findings" + string(os.PathSeparator) + "screenshots" + string(os.PathSeparator)
-	if rel == "." || !strings.HasPrefix(rel, prefix) || strings.Contains(rel, ".."+string(os.PathSeparator)) {
-		return "", false
-	}
-	base := filepath.Join(filepath.Clean(s.m.dir), "sessions")
-	matches, err := filepath.Glob(filepath.Join(base, "*", filepath.FromSlash(rel)))
-	if err != nil || len(matches) == 0 {
-		return "", false
-	}
-	var newest string
-	var newestTime int64
-	for _, candidate := range matches {
-		info, statErr := os.Stat(candidate)
-		if statErr != nil || info.IsDir() {
-			continue
-		}
-		mtime := info.ModTime().UnixNano()
-		if newest == "" || mtime > newestTime {
-			newest, newestTime = candidate, mtime
-		}
-	}
-	return newest, newest != ""
-}
-
-// archiveFindingScreenshots materializes report-referenced screenshots in the
-// task workspace. Browser runs use per-session working directories, while
-// reports intentionally use the portable findings/screenshots/ path.
-func (s *Server) archiveFindingScreenshots(taskID int64, markdown string) error {
-	if taskID <= 0 {
-		return nil
-	}
-	for _, match := range screenshotMarkdownLink.FindAllStringSubmatch(markdown, -1) {
-		raw := strings.TrimSpace(match[2])
-		rel := filepath.Clean(strings.TrimPrefix(raw, "/"))
-		const prefix = "findings" + string(os.PathSeparator) + "screenshots" + string(os.PathSeparator)
-		if !strings.HasPrefix(rel, prefix) || strings.Contains(rel, ".."+string(os.PathSeparator)) {
-			continue
-		}
-		target := filepath.Join(s.m.dir, "tasks", fmt.Sprint(taskID), rel)
-		if info, err := os.Stat(target); err == nil && !info.IsDir() {
-			continue
-		}
-		source, ok := s.resolveSessionScreenshot(rel)
-		if !ok {
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		in, err := os.Open(source)
-		if err != nil {
-			return err
-		}
-		out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-		if err == nil {
-			_, err = io.Copy(out, in)
-		}
-		_ = in.Close()
-		_ = out.Close()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) resolveSessionScreenshot(rel string) (string, bool) {
-	matches, err := filepath.Glob(filepath.Join(filepath.Clean(s.m.dir), "sessions", "*", rel))
-	if err != nil || len(matches) == 0 {
-		return "", false
-	}
-	var newest string
-	var newestTime int64
-	for _, candidate := range matches {
-		info, statErr := os.Stat(candidate)
-		if statErr != nil || info.IsDir() {
-			continue
-		}
-		if newest == "" || info.ModTime().UnixNano() > newestTime {
-			newest, newestTime = candidate, info.ModTime().UnixNano()
-		}
-	}
-	return newest, newest != ""
 }
 
 // POST /api/workspace/upload?path=<dir> — multipart form field "file" (one or more).
 func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
-	dirAbs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	dir, ok := s.wsResolveConfined(r.URL.Query().Get("path"))
 	if !ok {
-		writeErr(w, 400, "非法路径")
+		writeErr(w, 400, "invalid path")
 		return
 	}
-	if fi, err := os.Stat(dirAbs); err != nil || !fi.IsDir() {
-		writeErr(w, 400, "目标目录不存在")
+	if fi, err := os.Stat(dir.realPath); err != nil || !fi.IsDir() {
+		writeErr(w, 400, "target directory does not exist")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxWorkspaceUpload)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeErr(w, 400, "解析上传失败或超出大小限制："+err.Error())
+		writeErr(w, 400, "failed to parse upload or size limit exceeded: "+err.Error())
 		return
 	}
 	files := r.MultipartForm.File["file"]
 	if len(files) == 0 {
-		writeErr(w, 400, "缺少上传文件(表单字段 file)")
+		writeErr(w, 400, "missing upload file (form field file)")
 		return
 	}
+	dirRel := s.wsRel(dir.realPath)
 	saved := 0
 	for _, hdr := range files {
 		name := filepath.Base(hdr.Filename) // strip any path component
 		if name == "" || name == "." || name == ".." {
 			continue
 		}
-		destAbs, okd := s.wsResolve(filepath.Join(s.wsRel(dirAbs), name))
-		if !okd {
-			continue
+		destRel := name
+		if dirRel != "" {
+			destRel = dirRel + "/" + name
 		}
-		if err := saveUpload(hdr, destAbs); err != nil {
-			writeErr(w, 500, err.Error())
+		dest, okd := s.wsResolveConfined(destRel)
+		if !okd || dest.realPath == dest.realRoot {
+			writeErr(w, 400, "invalid path")
+			return
+		}
+		if err := saveUpload(hdr, dest.realPath); err != nil {
+			writeErr(w, 500, safeFSErr(err))
 			return
 		}
 		saved++

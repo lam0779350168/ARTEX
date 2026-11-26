@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -19,13 +18,13 @@ type goalSpec struct {
 }
 
 // launchTask runs the shared post-creation sequence for a task created via ANY
-// path (HTTP createTask 或 orchestration spawn_task),避免两处复制粘贴:
-//  1. seed 根资产,喂给事件驱动 loop;
-//  2. 可选种子意图,worker 免等首轮 planner 直接开跑;
-//  3. 后台异步做目标分解(发「第 0 轮目标拆解」round + LLM 分解步骤 + 逐条 goal,页面可见),
-//     分解完再 engine.Run —— 引擎在 goal 节点就绪后才启动,避免 planner 抢在 goal 之前跑的竞态。
+// path (HTTP createTask or orchestration spawn_task), avoiding copy-paste in both places:
+//  1. seed the root assets to feed the event-driven loop;
+//  2. an optional seed intent so the worker starts without waiting for the first planner round;
+//  3. decompose goals asynchronously in the background (emit a "round 0 goal decomposition" round + LLM decomposition steps + each goal, visible in the UI),
+//     then engine.Run once done — the engine starts only after the goal nodes are ready, avoiding a race where the planner runs before the goals exist.
 //
-// 异步(goroutine)所以调用方立即返回,两条路径行为一致:秒建任务、后台拆目标。
+// Asynchronous (goroutine) so the caller returns immediately; both paths behave the same: the task exists in seconds and goals decompose in the background.
 func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
@@ -36,7 +35,7 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	}
 	s.engine.decInflight(t.ID)
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
-		log.Printf("[concurrency] task %s 启动失败: %v", t.ID, err)
+		log.Printf("[concurrency] task %s failed to start: %v", t.ID, err)
 	}
 }
 
@@ -46,7 +45,7 @@ func (s *Server) startTaskEngine(t *Task) {
 		return
 	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-		Summary: "第 0 轮目标拆解"})
+		Summary: "round 0 goal decomposition"})
 	goals := s.createGoals(ctx, t, func(r db.Activity) {
 		s.engine.emitActivity(t, r)
 	})
@@ -108,39 +107,9 @@ func (s *Server) admitPausedTask(t *Task) (queued bool, err error) {
 	return s.admitTaskWhen(t, "resume", true)
 }
 
-func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (bool, error) {
-	return s.admitTaskWhenScheduled(t, mode, requirePaused, false)
-}
-func (s *Server) admitTaskWhenScheduled(t *Task, mode string, requirePaused, scheduled bool) (queued bool, err error) {
-	return s.admitTaskWhenScheduledWithReason(t, mode, requirePaused, scheduled, "", false)
-}
-
-// admitTaskWhenScheduledWithReason is the shared admission gate. A non-empty
-// requiredReason is checked after concMu is acquired, alongside the paused and
-// terminal checks, so proxy recovery cannot revive a task that was re-paused by
-// a user while the probe was in flight. preserveSchedule keeps calendar state
-// and never creates schedule_manual_until (used by proxy recovery).
-func (s *Server) admitTaskWhenScheduledWithReason(t *Task, mode string, requirePaused, scheduled bool, requiredReason string, preserveSchedule bool) (queued bool, err error) {
-	return s.admitTaskWhenScheduledWithGenerationChecked(t, mode, requirePaused, scheduled, requiredReason, preserveSchedule, 0, false)
-}
-
-// admitTaskWhenScheduledWithGeneration checks the supplied reconnect round.
-// Generation zero is valid; callers that do not have a round use the explicit
-// unchecked form through admitTaskWhenScheduledWithReason.
-func (s *Server) admitTaskWhenScheduledWithGeneration(t *Task, mode string, requirePaused, scheduled bool, requiredReason string, preserveSchedule bool, requiredGeneration uint64) (queued bool, err error) {
-	return s.admitTaskWhenScheduledWithGenerationChecked(t, mode, requirePaused, scheduled, requiredReason, preserveSchedule, requiredGeneration, true)
-}
-
-func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode string, requirePaused, scheduled bool, requiredReason string, preserveSchedule bool, requiredGeneration uint64, checkGeneration bool) (queued bool, err error) {
+func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued bool, err error) {
 	if t == nil {
 		return false, fmt.Errorf("task not found")
-	}
-	manualSchedule := requirePaused && !scheduled && !preserveSchedule
-	if manualSchedule {
-		// Match the calendar tick's lock order: scheduleMu before concMu. The
-		// override must commit before another tick can decide to pause this task.
-		s.scheduleMu.Lock()
-		defer s.scheduleMu.Unlock()
 	}
 	if mode != "bootstrap" {
 		mode = "resume"
@@ -159,36 +128,14 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 	}
 	defer s.engine.decInflight(t.ID)
 	lifecycle := t.lifecycleSnapshot()
-	if scheduled {
-		var managed bool
-		if err := s.m.pg.QueryRow(`SELECT schedule_paused FROM tasks WHERE id=$1`, t.ID).Scan(&managed); err != nil {
-			return false, err
-		}
-		if !managed {
-			return false, fmt.Errorf("人工暂停优先，计划不能恢复")
-		}
-	}
 	if requirePaused {
 		if isTerminalStatus(lifecycle.Status) {
-			return false, fmt.Errorf("终态任务不能执行继续")
+			return false, fmt.Errorf("a terminal task cannot be resumed")
 		}
 		if !lifecycle.Paused {
-			return false, fmt.Errorf("仅已暂停的任务可以继续")
-		}
-		if requiredReason != "" && lifecycle.PauseReason != requiredReason {
-			return false, fmt.Errorf("任务暂停原因已改变")
-		}
-		if requiredReason == "paused_by_proxy" && checkGeneration && lifecycle.ReconnectGeneration != requiredGeneration {
-			return false, fmt.Errorf("任务代理重连轮次已改变")
+			return false, fmt.Errorf("only a paused task can be resumed")
 		}
 		mode = s.resumeAdmissionMode(t)
-	}
-	var manualUntil *time.Time
-	if manualSchedule {
-		manualUntil, err = s.taskManualScheduleEnd(t.ID, time.Now())
-		if err != nil {
-			return false, err
-		}
 	}
 	wasTerminal := isTerminalStatus(lifecycle.Status)
 	wasPaused := lifecycle.Paused || s.engine.IsPaused(t.ID)
@@ -230,15 +177,15 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 	// this ordering, its already-running worker loops can claim the newly-opened
 	// intent in the gap between status=running and queued=true.
 	if shouldQueue || wasTerminal || wasPaused || wasQueued {
-		s.engine.Pause(t.ID, agent.Causef("queued_for_admission", "任务等待运行准入",
-			"任务正在等待并发队列或准入状态提交，本次执行已停止；只有获得运行槽后才会重新领取意图"))
+		s.engine.Pause(t.ID, agent.Causef("queued_for_admission", "task waiting for admission to run",
+			"the task is waiting on the concurrency queue or for its admission status to commit; this execution has stopped, and intents are claimed again only once it holds a run slot"))
 	}
 
 	status := lifecycle.Status
 	if wasTerminal {
 		status = "running"
 	}
-	if err := s.m.applyTaskAdmissionWithSchedule(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued, manualUntil, preserveSchedule); err != nil {
+	if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued); err != nil {
 		if !engineWasPaused && !wasPaused && !wasQueued {
 			s.engine.Resume(t)
 		}
@@ -249,19 +196,19 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 		// matching Engine gates before either parking it in FIFO or starting work;
 		// otherwise the old settling flag would make every worker skip forever.
 		s.engine.resetTimeoutRevival(t.ID)
-	} else if wasTerminal {
-		// A final settle round may finish as done. Revival must release its
-		// worker/planner barrier too, while preserving its deadline/checkpoint.
-		s.engine.settling.Delete(t.ID)
+	}
+	if wasTerminal && status == "running" {
+		// done/failed -> running: the previous run's settle state must not gate the new one.
+		s.engine.resetSettledRun(t.ID)
 	}
 	if shouldQueue {
 		if !wasQueued {
-			summary := fmt.Sprintf("已排队：达到并发上限 %d，等待空位后自动开始", limit)
+			summary := fmt.Sprintf("Queued: concurrency limit %d reached; starts automatically once a slot frees up", limit)
 			switch {
 			case !ready:
-				summary = "已排队：当前没有可运行的 LLM 配置，配置恢复后自动开始"
+				summary = "Queued: no runnable LLM configuration right now; starts automatically once one is available"
 			case readyBacklog:
-				summary = "已排队：已有更早的任务等待运行，将按 FIFO 顺序自动开始"
+				summary = "Queued: earlier tasks are already waiting; starts automatically in FIFO order"
 			}
 			s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: summary})
 		}
@@ -282,11 +229,6 @@ func (s *Server) hasReadyQueuedTask(excludeID string) bool {
 }
 
 func (s *Server) startAdmittedTask(t *Task, mode string) {
-	if s.engine.ReadyFor(t) {
-		if err := s.m.StartTaskRunSegment(t.ID); err != nil {
-			log.Printf("[runtime] task %s start segment failed: %v", t.ID, err)
-		}
-	}
 	if mode == "bootstrap" {
 		if !s.engine.beginTaskOperation(t.ID) {
 			return
@@ -328,15 +270,15 @@ func (s *Server) reconcileConcurrency() {
 				continue
 			}
 			mode := s.resumeAdmissionMode(task)
-			s.engine.Pause(task.ID, agent.Causef("llm_unavailable_queued", "LLM 不可用，任务进入等待队列",
-				"任务当前无法解析可运行的 Planner/Worker LLM，已释放并发槽；配置恢复后按队列顺序继续"))
+			s.engine.Pause(task.ID, agent.Causef("llm_unavailable_queued", "LLM unavailable, task moved to the wait queue",
+				"the task currently cannot resolve a runnable Planner/Worker LLM and has released its concurrency slot; it continues in queue order once the configuration recovers"))
 			if err := s.m.EnqueueTask(task.ID, mode); err != nil {
 				s.engine.Resume(task)
-				log.Printf("[concurrency] task %s 因 LLM 不可用入队失败: %v", task.ID, err)
+				log.Printf("[concurrency] task %s failed to enqueue due to LLM unavailability: %v", task.ID, err)
 				continue
 			}
 			s.engine.emitActivity(task, db.Activity{Worker: "system", Kind: "text",
-				Summary: "已排队：当前没有可运行的 LLM 配置，配置恢复后自动开始"})
+				Summary: "Queued: no runnable LLM configuration right now; starts automatically once one is available"})
 		}
 	}
 
@@ -408,18 +350,18 @@ func (s *Server) reconcileConcurrency() {
 	}
 }
 
-// reviveTask 让一个已停下的任务重新跑起来:把终态(done/failed/timeout)拉回 running、
-// 解除暂停,并(重)启动引擎循环 + 唤醒。已在 running 且未暂停的任务:只剩 Run 里的一次
-// Notify,近乎无副作用。用于「主 agent set_goals 新增目标」和「重跑 blocked 意图」两处。
+// reviveTask brings a stopped task back to running: pull a terminal state (done/failed/timeout) back to running,
+// lift the pause, and (re)start the engine loop + wake it. A task already running and not paused: only one Notify
+// inside Run, nearly side-effect free. Used by "main agent set_goals adds a goal" and "rerun a blocked intent".
 //
-// 为什么必须显式复活:planner/worker 循环的终态门(engine.go)会吞掉普通 notify——光改
-// 图 + Notify 唤不醒已判完成的任务;重启后终态任务的 goroutine 也可能已不在,故还要 Run。
+// Why revival must be explicit: the terminal-state gate of the planner/worker loops (engine.go)
+// swallows ordinary notifies — graph edits + Notify cannot wake a task judged complete; after a restart its goroutine may be gone, hence Run.
 func (s *Server) reviveTask(t *Task) {
 	if t == nil {
 		return
 	}
 	if _, err := s.admitTask(t, "resume"); err != nil {
-		log.Printf("[revive] task %s 恢复失败: %v", t.ID, err)
+		log.Printf("[revive] task %s failed to revive: %v", t.ID, err)
 	}
 }
 
@@ -458,7 +400,7 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 		// as a single goal so the task still has something to judge against. This is the
 		// only path that writes here — decomposed goals are already persisted by the tool.
 		if g := strings.TrimSpace(t.Goal); g != "" {
-			log.Printf("[goals] task %s: LLM 目标拆解无产出，回退为「原始目标作为单目标」", t.ID)
+			log.Printf("[goals] task %s: LLM goal decomposition produced nothing, falling back to the raw goal as a single goal", t.ID)
 			origin, _ := t.Store.OriginFactID()
 			id, _ := t.Store.AddNode(db.KindGoal, map[string]any{"text": g}, 0, "open", "system", nil)
 			if origin > 0 && id > 0 {

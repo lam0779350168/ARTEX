@@ -1,17 +1,16 @@
 "use client";
+
 import * as React from "react";
 
 import { ExplorationGraph } from "@/components/exploration-graph";
-import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { Edge, TaskNode } from "@/lib/types";
+import { t } from "@/i18n";
 
 // FindingLineageView renders the exploration sub-graph from the task's initial
-// node down to this finding's node — the same 攻击链路图 canvas as the task graph,
+// node down to this finding's node — the same exploration graph canvas as the task graph,
 // scoped to just this finding's lineage.
 export function FindingLineageView({ findingId }: { findingId: string }) {
-  const { ui } = useUITranslation();
-
   const [nodes, setNodes] = React.useState<TaskNode[]>([]);
   const [edges, setEdges] = React.useState<Edge[]>([]);
   const [loaded, setLoaded] = React.useState(false);
@@ -35,7 +34,11 @@ export function FindingLineageView({ findingId }: { findingId: string }) {
   }, [findingId]);
 
   if (loaded && nodes.length === 0) {
-    return <p className="text-muted-foreground p-6 text-sm">{ui("screen.081f5367ee5cc5")}</p>;
+    return (
+      <p className="text-muted-foreground p-6 text-sm">
+        {t("No lineage to display (this vulnerability is not linked to an exploration node, or its task has been deleted).")}
+      </p>
+    );
   }
 
   return (
@@ -43,7 +46,7 @@ export function FindingLineageView({ findingId }: { findingId: string }) {
       nodes={nodes}
       edges={edges}
       className="h-[68vh]"
-      emptyHint={loaded ? ui("screen.8a14e9e5a50155") : ui("screen.4927a53bcc886a")}
+      emptyHint={loaded ? t("No lineage") : t("Loading…")}
     />
   );
 }

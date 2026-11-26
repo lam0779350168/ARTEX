@@ -1,0 +1,14 @@
+#!/bin/sh
+# Search the local payload collections and ExploitDB for a term.
+set -u
+q="$*"
+if [ -z "$q" ]; then
+    echo "usage: payload-search <term>" >&2
+    exit 2
+fi
+echo "### PayloadsAllTheThings"
+grep -ril -- "$q" /opt/payloadsallthethings 2>/dev/null | head -40
+echo "### SecLists/Payloads"
+grep -ril -- "$q" /opt/seclists/Payloads 2>/dev/null | head -40
+echo "### ExploitDB"
+searchsploit --colour never "$q" 2>/dev/null | head -40

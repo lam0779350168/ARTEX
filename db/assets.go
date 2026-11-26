@@ -12,7 +12,7 @@ import (
 )
 
 // =====================================================================
-// 统一资产表
+// Unified assets table
 // =====================================================================
 
 // Asset is a row in the assets table.
@@ -160,7 +160,8 @@ func calcCSegment(ipStr string) string {
 	return ipnet.String()
 }
 
-// normalizeURL lowercases scheme and host, strips trailing slash from bare roots.
+// normalizeURL lowercases scheme and host, drops userinfo (credentials must
+// never reach assets.url), and strips trailing slash from bare roots.
 func normalizeURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -168,6 +169,7 @@ func normalizeURL(raw string) string {
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
 	u.Host = strings.ToLower(u.Host)
+	u.User = nil
 	s := u.String()
 	if strings.HasSuffix(s, "/") && u.Path == "/" && u.RawQuery == "" {
 		s = strings.TrimSuffix(s, "/")
@@ -219,7 +221,9 @@ func marshalStringArray(items []string) string {
 	}
 	escaped := make([]string, len(items))
 	for i, s := range items {
-		escaped[i] = `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+		s = strings.ReplaceAll(s, `\`, `\\`)
+		s = strings.ReplaceAll(s, `"`, `\"`)
+		escaped[i] = `"` + s + `"`
 	}
 	return "{" + strings.Join(escaped, ",") + "}"
 }
@@ -317,8 +321,8 @@ func ValidateAssetIP(value string) error {
 		return nil
 	}
 	return fmt.Errorf(
-		"%w: ip 必须是 IPv4/IPv6 地址，收到 %q。若这是主机名，请改用 type=subdomain 并填 domain 字段；"+
-			"若确实要登记地址，请先解析出 A/AAAA 记录，再用解析出的地址填 ip",
+		"%w: ip must be an IPv4/IPv6 address, got %q. If this is a hostname, use type=subdomain and fill the domain field instead; "+
+			"if you really need to register the address, resolve its A/AAAA records first, then fill ip with the resolved address",
 		ErrAssetIPInvalid, value)
 }
 

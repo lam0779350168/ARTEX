@@ -1,12 +1,10 @@
 "use client";
 
 import * as React from "react";
-
 import { Button } from "@/components/ui/button";
-import { localizedError } from "@/i18n/errors";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { api } from "@/lib/api";
 import type { Activity, InterceptExecution } from "@/lib/types";
+import { t } from "@/i18n";
 
 // Resolve one exact persisted call, independently of transcript pagination.
 export function useApprovalFocus({ taskId, conversationId }: { taskId?: string; conversationId?: number }) {
@@ -37,12 +35,12 @@ export function useApprovalFocus({ taskId, conversationId }: { taskId?: string; 
             ? source.conversation_id !== conversationId
             : source.task_id !== taskId || source.conversation_id != null
         ) {
-          throw new Error("chatUI.focusWrongOrigin");
+          throw new Error(t("Approval source does not match the current conversation"));
         }
         setState({ id, source, loading: false });
       })
       .catch((e) => {
-        if (!cancelled) setState({ id, error: (e as Error).message || "chatUI.focusUnavailable", loading: false });
+        if (!cancelled) setState({ id, error: (e as Error).message || t("Unable to locate the original execution"), loading: false });
       });
     return () => {
       cancelled = true;
@@ -81,13 +79,13 @@ export function useApprovalHistory(
         const page = await loadPage(before);
         if (cancelled) return;
         if (!page.items.length || (before > 0 && page.items[0].seq >= before)) {
-          throw new Error("chatUI.focusMissingDeleted");
+          throw new Error(t("Matching tool call not found in the conversation; the record may have been deleted"));
         }
         mergePage(page);
         current = page.items;
         before = current[0].seq;
         if (!page.hasMore && !current.some((a) => a.seq === source.seq)) {
-          throw new Error("chatUI.focusMissing");
+          throw new Error(t("Matching tool call not found in the conversation"));
         }
       }
       if (!cancelled) setResult({ source });
@@ -111,7 +109,6 @@ export function ApprovalExecutionFocus({
   focus: ReturnType<typeof useApprovalFocus>;
   history: ReturnType<typeof useApprovalHistory>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const { state } = focus;
   if (!state) return null;
   const error = state.error || history.error;
@@ -122,19 +119,19 @@ export function ApprovalExecutionFocus({
     >
       <span className={error ? "text-destructive" : "text-muted-foreground"}>
         {error
-          ? translate("chatUI.focusError", { error: localizedError(error, translate) })
+          ? t("Unable to locate: {error}", { error })
           : history.ready
-            ? translate("chatUI.focusReady", { id: state.id })
-            : translate("chatUI.focusLoading", { id: state.id })}
+            ? t("Expanded the tool call for approval #{id}", { id: state.id })
+            : t("Loading the conversation position of approval #{id}…", { id: state.id })}
       </span>
       <div className="flex gap-2">
         {error ? (
           <Button size="sm" variant="outline" onClick={focus.retry}>
-            {translate("chatUI.focusRetry")}
+            {t("Retry locate")}
           </Button>
         ) : null}
         <Button size="sm" variant="ghost" onClick={focus.close}>
-          {translate("chatUI.focusCancel")}
+          {t("Cancel locate")}
         </Button>
       </div>
     </div>

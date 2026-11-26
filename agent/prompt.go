@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"sync"
 	"text/template"
 	"time"
 )
@@ -10,22 +11,25 @@ import (
 // key and whether one exists. The server wires it to the PG agent_prompts table.
 // When nil or no override exists, agents use their built-in default prompt — so
 // behavior is identical until a user edits a prompt in the UI.
-var PromptOverride func(agentKey string) (string, bool)
+// Guarded by a lock: server wiring can run while agents render prompts.
+var (
+	promptOverrideMu sync.RWMutex
+	promptOverride   func(agentKey string) (string, bool)
+)
 
-// OpsecEnabled is wired by the server to the persisted global setting. Keeping
-// the block here makes it a code-owned runtime tail: database-edited prompts
-// cannot accidentally remove the operational safety guidance.
-var OpsecEnabled func() bool
+// SetPromptOverride installs (or, with nil, removes) the PromptOverride hook.
+func SetPromptOverride(f func(agentKey string) (string, bool)) {
+	promptOverrideMu.Lock()
+	promptOverride = f
+	promptOverrideMu.Unlock()
+}
 
-const opsecPromptBlock = `【OPSEC 准则（硬约束，仅次于授权范围和任务操作约束）】
-
-- 先复用已有流量、浏览器会话和已验证证据；能通过 traffic_search/traffic_get 或浏览器完成时，不要重复直接请求。
-- 所有目标交互必须经过平台配置的记录代理或浏览器工具，确保请求可追溯。
-- 不得使用裸 curl、urllib、requests 等工具的默认请求头直接访问目标。优先复用目标已有流量中的 User-Agent、Accept、Referer、Cookie 等请求特征；平台 HTTP 工具和采集模板的默认 UA 由系统随机策略提供，同一次请求的重定向、重试必须保持一致，明确配置的 UA 优先。
-- 不得使用 -k、--ignore-https-errors、verify=False 等方式绕过证书校验；平台代理 CA 已配置时应正常验证。
-- 不得批量并发、快速循环、无节制重试、端口横扫、目录爆破或大规模扫描；遇到限速、验证码、WAF 或异常响应时立即停止当前方向，不得通过更换 UA 继续当前方向。
-- OPSEC 不扩大授权范围；目标、主机、端口、路径或账号不在授权范围内时不得访问。
-- 请求和响应是否留痕由平台代理和浏览器负责；不要额外复制完整请求头、Cookie 或响应正文。`
+// PromptOverride returns the current hook, or nil when none is set.
+func PromptOverride() func(agentKey string) (string, bool) {
+	promptOverrideMu.RLock()
+	defer promptOverrideMu.RUnlock()
+	return promptOverride
+}
 
 // Prompt-variable structs — fields mirror each agent's catalog (docs §5a) so a
 // user template referencing a catalog variable renders; referencing anything else
@@ -41,37 +45,29 @@ type GoalsVars struct{ EngagementDescription, DataDir, Now string }
 // elapsed time (e.g. a timed benchmark's "last N hours" window).
 func nowStr() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
 
-// renderSystem returns the rendered system-prompt BODY (段 [A]) for agentKey.
+// renderSystem returns the rendered system-prompt BODY (section [A]) for agentKey.
 // Precedence: the DB-stored template (if any) over the built-in default template
 // (def). BOTH are Go templates now — the built-in default is seeded into the DB
 // verbatim, so the two paths render identically until a user edits the prompt.
 // Rendering always runs (def used to be pre-substituted plain text; it is now a
 // {{.Var}} template like the DB one). On any render error we fall back to the
 // default template, then to the raw default string — an agent never starts with a
-// half-rendered prompt. Callers append the code-owned tail (trafficTool / 中间产物
-// 输出规约) AFTER this, so those can't be edited away via the DB body.
+// half-rendered prompt. Callers append the code-owned tail (trafficTool /
+// intermediate artifact output rules) AFTER this, so those can't be edited away via
+// the DB body.
 func renderSystem(agentKey, def string, vars any) string {
 	tmpl := def
-	if PromptOverride != nil {
-		if t, ok := PromptOverride(agentKey); ok && t != "" {
+	if override := PromptOverride(); override != nil {
+		if t, ok := override(agentKey); ok && t != "" {
 			tmpl = t
 		}
 	}
 	if out, err := renderTmpl(tmpl, vars); err == nil {
-		if OpsecEnabled != nil && OpsecEnabled() {
-			return out + "\n\n" + opsecPromptBlock
-		}
 		return out
 	}
 	// DB template broke (e.g. references an out-of-catalog var) → code default.
 	if out, err := renderTmpl(def, vars); err == nil {
-		if OpsecEnabled != nil && OpsecEnabled() {
-			return out + "\n\n" + opsecPromptBlock
-		}
 		return out
-	}
-	if OpsecEnabled != nil && OpsecEnabled() {
-		return def + "\n\n" + opsecPromptBlock
 	}
 	return def
 }

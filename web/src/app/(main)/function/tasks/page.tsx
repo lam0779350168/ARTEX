@@ -16,7 +16,6 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import type { TFunction } from "i18next";
 import {
   ArchiveIcon,
   ArrowDownIcon,
@@ -25,8 +24,6 @@ import {
   ChevronRightIcon,
   EyeIcon,
   FolderInputIcon,
-  GlobeIcon,
-  GlobeOffIcon,
   GripVerticalIcon,
   Loader2Icon,
   PaperclipIcon,
@@ -36,11 +33,11 @@ import {
   PinOffIcon,
   PlayIcon,
   PlusIcon,
+  TrashIcon,
   SaveIcon,
   SearchIcon,
   SlidersHorizontalIcon,
   StarIcon,
-  TablePropertiesIcon,
   TagsIcon,
   Trash2Icon,
   Undo2Icon,
@@ -49,13 +46,10 @@ import {
 import { toast } from "sonner";
 
 import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
-import { DateSelect } from "@/components/date-select";
-import { RemarkEditor } from "@/components/remark-editor";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
-import { TimeSelect } from "@/components/time-select";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -125,13 +119,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { taskError } from "@/i18n/task-runtime";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
-import { api, type ScheduleInput } from "@/lib/api";
+import { intlLocale, t } from "@/i18n";
+import { setVisibleInterval } from "@/lib/polling";
+import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
   AssetInterceptRuleInput,
+  TaskCredentialInput,
   ChatAttachment,
   Company,
   DeleteTaskOptions,
@@ -143,7 +138,6 @@ import type {
   TaskCategory,
   TaskStatus,
 } from "@/lib/types";
-import { MAX_TASK_REMARK_RUNES, MAX_TASK_WORKER_COUNT, parseWorkerCountInput } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // fmtBytes renders a human file size for the upload manifest.
@@ -155,22 +149,22 @@ function fmtBytes(n: number): string {
 
 // UPLOAD_MARKER labels the auto-appended block of uploaded-file paths inside the task
 // description, so re-uploads append under the same block instead of adding a new header.
-const UPLOAD_MARKER = "【上传文件（绝对路径）】";
+const UPLOAD_MARKER = "[Uploaded Files (Absolute Paths)]";
 
 // appendUploads folds newly-uploaded files' ABSOLUTE paths into the description as a
 // Read/Bash-friendly manifest — the worker opens them by path. Keeps one marked block:
 // first upload adds the header, later uploads append bullets under it.
 function appendUploads(desc: string, atts: ChatAttachment[]): string {
-  const bullets = atts.map((a) => `- ${a.abs ?? a.path}（${fmtBytes(a.size)}）`).join("\n");
+  const bullets = atts.map((a) => `- ${a.abs ?? a.path} (${fmtBytes(a.size)})`).join("\n");
   if (desc.includes(UPLOAD_MARKER)) {
     return `${desc.replace(/\s*$/, "")}\n${bullets}\n`;
   }
   const head = desc.trim() ? `${desc.replace(/\s*$/, "")}\n\n` : "";
-  return `${head}${UPLOAD_MARKER} worker 可用 Read/Bash 按路径打开：\n${bullets}\n`;
+  return `${head}${UPLOAD_MARKER} worker can open them by path with Read/Bash:\n${bullets}\n`;
 }
 
 // POLL_MS is the task-list refresh interval. Task state moves on the server (planner /
-// worker), so the list has to be pulled; 10s is plenty for status / 进度 / token 变化.
+// worker), so the list has to be pulled; 10s is plenty for status / progress / token changes.
 const POLL_MS = 10_000;
 const MAX_SOURCE_TASKS = 8;
 
@@ -188,78 +182,73 @@ function fmtDuration(sec: number): string {
   const h = Math.floor((sec % 86400) / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
+  if (d > 0) return t("{d}d {h}h", { d, h });
+  if (h > 0) return t("{h}h {m}m", { h, m });
+  if (m > 0) return t("{m}m {s}s", { m, s });
+  return t("{s}s", { s });
 }
 
-// taskDuration counts only active execution segments. A live segment ticks locally;
-// paused, queued, and terminal tasks stay fixed at their persisted active total.
+// taskDuration is the task's run duration in seconds: created → now while running,
+// created → completion for a finished task, else created → last activity. 0 when it
+// never ran (no activity yet).
 function taskDuration(task: Task, nowSec: number): number {
-  const active = Math.max(0, Math.floor(task.active_run_seconds ?? 0));
-  const segmentStart = task.run_segment_started_unix ?? 0;
-  if (task.status === "running" && !task.paused && !task.queued && segmentStart > 0) {
-    return active + Math.max(0, Math.floor(nowSec - segmentStart));
-  }
-  return active;
+  const start = task.created_unix ?? 0;
+  if (!start) return 0;
+  const end =
+    task.status === "running"
+      ? nowSec
+      : task.completed_unix && task.completed_unix > 0
+        ? task.completed_unix
+        : (task.last_activity_unix ?? 0);
+  return end > start ? end - start : 0;
 }
 
 // deleteDetails takes only the countable part of the result so callers can pass an
 // aggregate accumulated over a bulk delete.
 type DeleteCounts = Omit<DeleteTaskResult, "deleted" | "cleanup_warning">;
 
-function deleteDetails(result: DeleteCounts, translate: TFunction): string[] {
+function deleteDetails(result: DeleteCounts): string[] {
   const details: string[] = [];
-  if (result.assets_deleted > 0) details.push(translate("taskUI.deletedAssets", { count: result.assets_deleted }));
-  if (result.assets_detached > 0) details.push(translate("taskUI.detachedAssets", { count: result.assets_detached }));
-  if (result.traffic_deleted > 0) details.push(translate("taskUI.deletedTraffic", { count: result.traffic_deleted }));
-  if (result.files_deleted) details.push(translate("taskUI.filesDeleted"));
-  if (result.findings_deleted > 0)
-    details.push(translate("taskUI.deletedFindings", { count: result.findings_deleted }));
-  if (result.llm_records_deleted > 0)
-    details.push(translate("taskUI.deletedLLM", { count: result.llm_records_deleted }));
+  if (result.assets_deleted > 0) details.push(t("Deleted {count} assets", { count: result.assets_deleted }));
+  if (result.assets_detached > 0) details.push(t("Detached {count} shared assets", { count: result.assets_detached }));
+  if (result.traffic_deleted > 0) details.push(t("Deleted {count} traffic records", { count: result.traffic_deleted }));
+  if (result.files_deleted) details.push(t("Deleted task files"));
+  if (result.findings_deleted > 0) details.push(t("Deleted {count} findings", { count: result.findings_deleted }));
+  if (result.llm_records_deleted > 0) details.push(t("Deleted {count} LLM request/response records", { count: result.llm_records_deleted }));
   return details;
 }
 
-function deleteSummary(result: DeleteTaskResult, translate: TFunction): string {
-  const details = deleteDetails(result, translate);
-  return details.length > 0
-    ? translate("taskUI.deletedDetails", { details: details.join(", ") })
-    : translate("taskUI.taskDeleted");
+function deleteSummary(result: DeleteTaskResult): string {
+  const details = deleteDetails(result);
+  return details.length > 0 ? t("Task deleted ({details})", { details: details.join(", ") }) : t("Task deleted");
 }
 
 // fmtDateTime renders a unix-seconds timestamp as a compact local date-time
 // (MM-DD HH:mm), or "—" when unset.
-function fmtDateTime(unix: number | undefined, locale: string): string {
+function fmtDateTime(unix?: number): string {
   if (!unix || unix <= 0) return "—";
   const d = new Date(unix * 1000);
-  return d.toLocaleString(locale, {
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
-  { value: "created", label: "taskUI.created" },
-  { value: "queued", label: "taskUI.queued" },
-  { value: "running", label: "taskUI.running" },
-  { value: "paused", label: "taskUI.paused" },
-  { value: "done", label: "taskUI.done" },
-  { value: "failed", label: "taskUI.failed" },
-  { value: "timeout", label: "taskUI.timeout" },
+  { value: "created", label: t("Created") },
+  { value: "queued", label: t("Queued") },
+  { value: "running", label: t("Running") },
+  { value: "paused", label: t("Paused") },
+  { value: "done", label: t("Completed") },
+  { value: "failed", label: t("Failed") },
+  { value: "timeout", label: t("Timed out") },
 ];
 
-// Select 不接受空字符串 value,所以「无分类」在筛选器、新建表单和批量移动里
-// 统一用这个哨兵值,提交时再翻译成后端的 null。
+// Select does not accept an empty-string value, so "no category" in the filter, the create form, and the bulk move
+// all use this sentinel value, which is translated back to the backend's null on submit.
 const UNCATEGORIZED_VALUE = "uncategorized";
 
-// 可暂停 = 非终态且未暂停,与后端 applyTaskControlWithCause 的门控一致
-// (done/failed/timeout 为终态);paused 才可继续。行内按钮与批量控制共用此判断,
-// 两边不会出现一个可点、另一个不可点的分歧。
+// Pausable = non-terminal and not paused, matching the backend's applyTaskControlWithCause gating
+// (done/failed/timeout are terminal); only paused can be resumed. The inline buttons and the bulk controls share this check,
+// so the two sides can never disagree about one being clickable and the other not.
 const PAUSABLE_STATUSES = new Set<TaskStatus>(["created", "queued", "running"]);
 const ARCHIVABLE_STATUSES = new Set<TaskStatus>(["paused", "done", "failed", "timeout"]);
 
@@ -274,38 +263,6 @@ type TaskSortField = "id" | "created" | "duration" | "status";
 const TASK_SORT_FIELDS: readonly TaskSortField[] = ["id", "created", "duration", "status"];
 const TASK_SORT_PREFERENCE_KEY = "artex_task_list_sort";
 const TASK_FILTER_PREFERENCE_KEY = "artex_task_list_filters";
-const TASK_COLUMNS_PREFERENCE_KEY = "artex_task_list_columns";
-type TaskColumnKey =
-  | "id"
-  | "name"
-  | "remark"
-  | "description"
-  | "goal"
-  | "status"
-  | "progress"
-  | "findings"
-  | "inFlight"
-  | "created"
-  | "duration"
-  | "tokens";
-const TASK_COLUMNS: readonly { key: TaskColumnKey; label: string }[] = [
-  ["id", "ID"],
-  ["name", "taskUI.name"],
-  ["remark", "taskUI.remark"],
-  ["description", "taskUI.description"],
-  ["goal", "taskUI.goal"],
-  ["status", "taskUI.status"],
-  ["progress", "taskUI.progress"],
-  ["findings", "taskUI.findings"],
-  ["inFlight", "taskUI.workers"],
-  ["created", "taskUI.createdAt"],
-  ["duration", "taskUI.duration"],
-  ["tokens", "Token"],
-].map(([key, label]) => ({ key: key as TaskColumnKey, label }));
-const DEFAULT_TASK_COLUMNS = Object.fromEntries(TASK_COLUMNS.map(({ key }) => [key, true])) as Record<
-  TaskColumnKey,
-  boolean
->;
 
 const TASK_STATUS_RANK = new Map(STATUS_OPTIONS.map((option, index) => [option.value, index]));
 
@@ -314,10 +271,7 @@ function taskIsPinned(task: Task): boolean {
 }
 
 function compareTaskIDs(left: string, right: string): number {
-  return left.localeCompare(right, undefined, {
-    numeric: true,
-    sensitivity: "base",
-  });
+  return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
 }
 
 function taskCreatedUnix(task: Task): number {
@@ -353,7 +307,6 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
 }
 
 export default function TasksPage() {
-  const { t: translate, liveT } = useLiveTranslation();
   const [activeTab, setActiveTab] = React.useState("current");
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [categories, setCategories] = React.useState<TaskCategory[]>([]);
@@ -374,34 +327,12 @@ export default function TasksPage() {
   const [nowSec, setNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
   const [batchControlling, setBatchControlling] = React.useState<"pause" | "resume" | null>(null);
   const [movingCategory, setMovingCategory] = React.useState(false);
-  const [visibleColumns, setVisibleColumns] = React.useState<Record<TaskColumnKey, boolean>>(DEFAULT_TASK_COLUMNS);
-  React.useEffect(() => {
-    const raw = getLocalStorageValue(TASK_COLUMNS_PREFERENCE_KEY);
-    if (!raw) return;
-    try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      setVisibleColumns(
-        (current) =>
-          Object.fromEntries(
-            TASK_COLUMNS.map(({ key }) => [key, typeof parsed[key] === "boolean" ? parsed[key] : current[key]]),
-          ) as Record<TaskColumnKey, boolean>,
-      );
-    } catch {
-      // Ignore malformed saved preferences.
-    }
-  }, []);
-  React.useEffect(() => {
-    setLocalStorageValue(TASK_COLUMNS_PREFERENCE_KEY, JSON.stringify(visibleColumns));
-  }, [visibleColumns]);
 
   React.useEffect(() => {
     const raw = getLocalStorageValue(TASK_FILTER_PREFERENCE_KEY);
     if (raw) {
       try {
-        const parsed = JSON.parse(raw) as {
-          status?: unknown;
-          category?: unknown;
-        };
+        const parsed = JSON.parse(raw) as { status?: unknown; category?: unknown };
         if (parsed.status === "all" || STATUS_OPTIONS.some((option) => option.value === parsed.status)) {
           setStatusFilter(parsed.status as TaskStatus | "all");
         }
@@ -457,10 +388,7 @@ export default function TasksPage() {
     (field: TaskSortField) => {
       setSortPreference((current) => {
         if (current.field !== field) return { field, direction: "desc" };
-        return {
-          field,
-          direction: current.direction === "asc" ? "desc" : "asc",
-        };
+        return { field, direction: current.direction === "asc" ? "desc" : "asc" };
       });
     },
     [setSortPreference],
@@ -477,7 +405,7 @@ export default function TasksPage() {
     [ordered, page, pageSize],
   );
 
-  // 多选删除:选择跨翻页/筛选保留,只在任务真的消失(被删或后端不再返回)时收敛。
+  // Multi-select delete: the selection survives paging/filter changes and only shrinks when a task truly disappears (deleted or no longer returned by the backend).
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set());
 
   React.useEffect(() => {
@@ -559,8 +487,8 @@ export default function TasksPage() {
   React.useEffect(() => {
     load();
     loadCategories();
-    const i = setInterval(load, POLL_MS);
-    return () => clearInterval(i);
+    const stopPolling = setVisibleInterval(load, POLL_MS);
+    return stopPolling;
   }, [load, loadCategories]);
 
   const refreshCategoriesAndTasks = React.useCallback(() => {
@@ -573,13 +501,7 @@ export default function TasksPage() {
     (taskID: string, category: TaskCategory | null) => {
       setTasks((current) => {
         const next = current.map((task) =>
-          task.id === taskID
-            ? {
-                ...task,
-                category_id: category?.id,
-                category_name: category?.name,
-              }
-            : task,
+          task.id === taskID ? { ...task, category_id: category?.id, category_name: category?.name } : task,
         );
         lastRef.current = JSON.stringify(next);
         return next;
@@ -595,11 +517,11 @@ export default function TasksPage() {
     if (!categories.some((category) => String(category.id) === categoryFilter)) setCategoryFilter("all");
   }, [categories, categoriesLoaded, categoryFilter]);
 
-  // 只在确有 running 任务时才每秒 tick——其余情况「运行时长」是静态值,空转的 tick 会白白
-  // 重渲染整张表。
+  // Only tick every second when there really is a running task — otherwise "duration" is static, and an idle tick would
+  // re-render the whole table for nothing.
   const hasRunning = React.useMemo(() => tasks.some((t) => t.status === "running"), [tasks]);
 
-  // tick every second so running tasks' 运行时长 counts up live.
+  // tick every second so running tasks' duration counts up live.
   React.useEffect(() => {
     if (!hasRunning) return;
     setNowSec(Math.floor(Date.now() / 1000));
@@ -613,56 +535,48 @@ export default function TasksPage() {
         const result = await api.deleteTask(id, options);
         if (result.cleanup_warning) {
           toast.warning(
-            liveT("taskUI.cleanupWarning", { summary: deleteSummary(result, liveT), message: result.cleanup_warning }),
+            t("{summary}; some external data cleanup did not finish: {warning}", {
+              summary: deleteSummary(result),
+              warning: result.cleanup_warning,
+            }),
           );
         } else {
-          toast.success(deleteSummary(result, liveT));
+          toast.success(deleteSummary(result));
         }
         load();
       } catch (e) {
-        toast.error(liveT("taskUI.deleteError", { message: taskError(e, liveT) }));
+        toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
         throw e;
       }
     },
-    [load, liveT],
+    [load],
   );
 
-  // controlTask 是行内暂停/继续:批量走 controlTasksBatch,单行走单任务接口,省去
-  // 「先勾选再点批量」。清空 lastRef 让下一次轮询即使负载相同也照单接收,否则状态
-  // 回写会被去重挡掉、按钮看起来没反应。
+  // controlTask is the inline pause/resume: bulk goes through controlTasksBatch, a single row uses the single-task endpoint, saving the
+  // "check first, then click bulk" detour. Clearing lastRef lets the next poll be accepted even with an identical payload; otherwise the state
+  // write-back would be swallowed by dedup and the button would look unresponsive.
   const controlTask = React.useCallback(
     async (id: string, action: "pause" | "resume") => {
       try {
         const result = await api.controlTask(id, action);
         toast.success(
           action === "pause"
-            ? liveT("taskUI.taskPaused", { id: id })
-            : liveT("taskUI.taskResumed", { id: id, queue: result.queued ? liveT("taskUI.queueSuffix") : "" }),
+            ? t("Task #{id} paused", { id })
+            : result.queued
+              ? t("Task #{id} resumed, queued", { id })
+              : t("Task #{id} resumed", { id }),
         );
       } catch (e) {
         toast.error(
-          liveT("taskUI.actionFailed", {
-            action: action === "pause" ? liveT("taskUI.pause") : liveT("taskUI.resume"),
-            message: taskError(e, liveT),
-          }),
+          action === "pause"
+            ? t("Pause failed: {error}", { error: (e as Error).message })
+            : t("Resume failed: {error}", { error: (e as Error).message }),
         );
       } finally {
-        // 无论成败都刷新:失败多半是状态已变化,重新拉取才能让按钮回到正确形态。
+        // Refresh regardless of outcome: failures usually mean the state changed, and re-fetching restores the right button shape.
         lastRef.current = "";
         load();
       }
-    },
-    [load, liveT],
-  );
-
-  const updateTaskRemark = React.useCallback(
-    async (task: Task, remark: string) => {
-      const updated = await api.updateTask(task.id, { remark });
-      setTasks((current) =>
-        current.map((entry) => (entry.id === task.id ? { ...entry, remark: updated.remark } : entry)),
-      );
-      lastRef.current = "";
-      load();
     },
     [load],
   );
@@ -671,15 +585,15 @@ export default function TasksPage() {
     async (task: Task, name: string) => {
       try {
         await api.renameTask(task.id, name);
-        toast.success(liveT("taskUI.taskRenamed", { id: task.id }));
+        toast.success(t("Task #{id} renamed", { id: task.id }));
         lastRef.current = "";
         load();
       } catch (error) {
-        toast.error(liveT("taskUI.renameFailed", { message: taskError(error, liveT) }));
+        toast.error(t("Rename failed: {error}", { error: (error as Error).message }));
         throw error;
       }
     },
-    [load, liveT],
+    [load],
   );
 
   const toggleTaskPinned = React.useCallback(
@@ -687,64 +601,39 @@ export default function TasksPage() {
       const pinned = taskIsPinned(task);
       try {
         await api.pinTask(task.id, !pinned);
-        toast.success(
-          pinned ? liveT("taskUI.taskUnpinned", { id: task.id }) : liveT("taskUI.taskPinned", { id: task.id }),
-        );
+        toast.success(pinned ? t("Task #{id} unpinned", { id: task.id }) : t("Task #{id} pinned", { id: task.id }));
         lastRef.current = "";
         load();
       } catch (error) {
         toast.error(
-          liveT("taskUI.actionFailed", {
-            action: pinned ? liveT("taskUI.unpin") : liveT("taskUI.pinAction"),
-            message: taskError(error, liveT),
-          }),
+          pinned
+            ? t("Unpin failed: {error}", { error: (error as Error).message })
+            : t("Pin failed: {error}", { error: (error as Error).message }),
         );
         throw error;
       }
     },
-    [load, liveT],
-  );
-
-  const toggleTaskGlobalAssets = React.useCallback(
-    async (task: Task) => {
-      const enabled = task.share_global_assets === true;
-      try {
-        const updated = await api.updateTask(task.id, {
-          share_global_assets: !enabled,
-        });
-        setTasks((current) =>
-          current.map((entry) =>
-            entry.id === task.id ? { ...entry, share_global_assets: updated.share_global_assets } : entry,
-          ),
-        );
-        toast.success(liveT(enabled ? "taskUI.globalAssetsDisabled" : "taskUI.globalAssetsEnabled", { id: task.id }));
-        lastRef.current = "";
-        load();
-      } catch (error) {
-        toast.error(liveT("taskUI.settingFailed", { message: taskError(error, liveT) }));
-      }
-    },
-    [load, liveT],
+    [load],
   );
 
   const queueTaskArchive = React.useCallback(
     async (task: Task) => {
       try {
         await api.archiveTask(task.id);
-        toast.success(liveT("taskUI.taskArchiveQueued", { id: task.id }));
+        toast.success(t("Task #{id} queued for archiving", { id: task.id }));
         setActiveTab("archived");
         lastRef.current = "";
         load();
       } catch (error) {
-        toast.error(liveT("taskUI.archiveError", { message: taskError(error, liveT) }));
+        toast.error(t("Archive failed: {error}", { error: (error as Error).message }));
         throw error;
       }
     },
-    [load, liveT],
+    [load],
   );
 
-  // deleteTasks 逐个删除所选任务:后端没有批量接口,且单次删除会连带清理资产/流量/文件,
-  // 串行执行以免一次性打爆后端;成功的从选中集移除,失败的保留以便重试。
+  // deleteTasks deletes the selected tasks one by one: the backend has no batch endpoint, and each delete cascades into cleaning assets/traffic/files,
+  // so they run serially to avoid overwhelming the backend at once; successes leave the selection, failures stay for retry.
   const deleteTasks = React.useCallback(
     async (ids: string[], options: DeleteTaskOptions, onProgress: (done: number) => void) => {
       const total: DeleteCounts = {
@@ -768,10 +657,10 @@ export default function TasksPage() {
           total.files_deleted = total.files_deleted || r.files_deleted;
           total.findings_deleted += r.findings_deleted;
           total.llm_records_deleted += r.llm_records_deleted;
-          if (r.cleanup_warning) warnings.push(`#${id}：${r.cleanup_warning}`);
+          if (r.cleanup_warning) warnings.push(`#${id}: ${r.cleanup_warning}`);
           deleted.push(id);
         } catch (e) {
-          failed.push({ id, message: taskError(e, liveT) });
+          failed.push({ id, message: (e as Error).message });
         }
         onProgress(deleted.length + failed.length);
       }
@@ -782,12 +671,13 @@ export default function TasksPage() {
           for (const id of deleted) next.delete(id);
           return next;
         });
-        const details = deleteDetails(total, liveT);
+        const details = deleteDetails(total);
         const summary =
-          liveT("taskUI.deletedTasks", { count: deleted.length }) +
-          (details.length > 0 ? `（${details.join(", ")}）` : "");
+          details.length > 0
+            ? t("Deleted {count} tasks ({details})", { count: deleted.length, details: details.join(", ") })
+            : t("Deleted {count} tasks", { count: deleted.length });
         if (warnings.length > 0) {
-          toast.warning(liveT("taskUI.cleanupWarning", { summary: summary, message: warnings.join("; ") }));
+          toast.warning(t("{summary}; some external data cleanup did not finish: {warning}", { summary, warning: warnings.join("; ") }));
         } else {
           toast.success(summary);
         }
@@ -795,19 +685,17 @@ export default function TasksPage() {
       if (failed.length > 0) {
         const head = failed
           .slice(0, 3)
-          .map((f) => liveT("taskUI.itemError", { id: f.id, message: f.message }))
+          .map((f) => `#${f.id} (${f.message})`)
           .join("; ");
         toast.error(
-          liveT("taskUI.deleteFailures", {
-            count: failed.length,
-            details: head,
-            more: failed.length > 3 ? liveT("taskUI.andMore") : "",
-          }),
+          failed.length > 3
+            ? t("{count} tasks failed to delete: {details} and more", { count: failed.length, details: head })
+            : t("{count} tasks failed to delete: {details}", { count: failed.length, details: head }),
         );
       }
       load();
     },
-    [load, liveT],
+    [load],
   );
 
   const selectedTasks = React.useMemo(() => tasks.filter((task) => selectedIds.has(task.id)), [tasks, selectedIds]);
@@ -829,19 +717,14 @@ export default function TasksPage() {
     const result = await api.archiveTasks(archivableTaskIDs);
     const succeeded = result.items.filter((item) => item.ok);
     const failed = result.items.filter((item) => !item.ok);
-    if (succeeded.length > 0) toast.success(liveT("taskUI.tasksArchiveQueued", { count: succeeded.length }));
+    if (succeeded.length > 0) toast.success(t("Queued {count} tasks for archiving", { count: succeeded.length }));
     if (failed.length > 0) {
       toast.error(
-        liveT("taskUI.archiveFailures", {
+        t("{count} tasks could not be archived: {details}", {
           count: failed.length,
           details: failed
             .slice(0, 3)
-            .map((item) =>
-              liveT("taskUI.itemError", {
-                id: item.id,
-                message: item.error ? taskError(item.error, liveT) : liveT("taskUI.stateChanged"),
-              }),
-            )
+            .map((item) => `#${item.id} (${item.error || t("state changed")})`)
             .join("; "),
         }),
       );
@@ -850,13 +733,13 @@ export default function TasksPage() {
     setActiveTab("archived");
     lastRef.current = "";
     load();
-  }, [archivableTaskIDs, load, liveT]);
+  }, [archivableTaskIDs, load]);
 
   const controlSelectedTasks = React.useCallback(
     async (action: "pause" | "resume", ids: string[]) => {
       if (ids.length === 0 || batchControlling) return;
       if (ids.length > 100) {
-        toast.error(liveT("taskUI.batchLimit"));
+        toast.error(t("You can control at most 100 tasks at once"));
         return;
       }
       setBatchControlling(action);
@@ -867,51 +750,45 @@ export default function TasksPage() {
         if (succeeded.length > 0) {
           toast.success(
             action === "pause"
-              ? liveT("taskUI.tasksPaused", { count: succeeded.length })
-              : liveT("taskUI.tasksResumed", {
-                  count: succeeded.length,
-                  queue: succeeded.some((item) => item.queued) ? liveT("taskUI.queueSome") : "",
-                }),
+              ? t("Paused {count} tasks", { count: succeeded.length })
+              : succeeded.some((item) => item.queued)
+                ? t("Resumed {count} tasks, some tasks were queued", { count: succeeded.length })
+                : t("Resumed {count} tasks", { count: succeeded.length }),
           );
         }
         if (failed.length > 0) {
           const details = failed
             .slice(0, 3)
-            .map((item) =>
-              liveT("taskUI.itemError", { id: item.id, message: item.error || liveT("taskUI.stateChanged") }),
-            )
+            .map((item) => `#${item.id} (${item.error || t("state changed")})`)
             .join("; ");
           toast.error(
-            liveT("taskUI.controlFailures", {
-              count: failed.length,
-              details: details,
-              more: failed.length > 3 ? liveT("taskUI.andMore") : "",
-            }),
+            failed.length > 3
+              ? t("{count} tasks failed: {details} and more", { count: failed.length, details })
+              : t("{count} tasks failed: {details}", { count: failed.length, details }),
           );
         }
         lastRef.current = "";
         load();
       } catch (error) {
         toast.error(
-          liveT("taskUI.actionFailed", {
-            action: action === "pause" ? liveT("taskUI.batchPause") : liveT("taskUI.batchResume"),
-            message: taskError(error, liveT),
-          }),
+          action === "pause"
+            ? t("Bulk pause failed: {error}", { error: (error as Error).message })
+            : t("Bulk resume failed: {error}", { error: (error as Error).message }),
         );
       } finally {
         setBatchControlling(null);
       }
     },
-    [batchControlling, load, liveT],
+    [batchControlling, load],
   );
 
-  // 后端把整批分类写入放在一个事务里，所以失败项只可能是勾选后又被删掉的任务。
+  // The backend writes the whole batch's category changes in one transaction, so the only failures can be tasks deleted after being checked.
   const moveSelectedTasksCategory = React.useCallback(
     async (categoryID?: number) => {
       const ids = [...selectedIds];
       if (ids.length === 0 || movingCategory) return;
       if (ids.length > 100) {
-        toast.error(liveT("taskUI.categoryBatchLimit"));
+        toast.error(t("You can change the category of at most 100 tasks at once"));
         return;
       }
       setMovingCategory(true);
@@ -919,44 +796,37 @@ export default function TasksPage() {
         const result = await api.updateTasksCategory(ids, categoryID);
         const succeeded = result.items.filter((item) => item.ok);
         const failed = result.items.filter((item) => !item.ok);
-        const target = result.category?.name ?? liveT("taskUI.uncategorized");
+        const target = result.category?.name ?? t("Uncategorized");
         if (succeeded.length > 0) {
-          toast.success(liveT("taskUI.tasksMoved", { count: succeeded.length, category: target }));
+          toast.success(t("Moved {count} tasks to \"{target}\"", { count: succeeded.length, target }));
           setSelectedIds(new Set());
         }
         if (failed.length > 0) {
           const details = failed
             .slice(0, 3)
-            .map((item) =>
-              liveT("taskUI.itemError", {
-                id: item.id,
-                message: item.error ? taskError(item.error, liveT) : liveT("taskUI.taskMissing"),
-              }),
-            )
+            .map((item) => `#${item.id} (${item.error || t("task no longer exists")})`)
             .join("; ");
           toast.error(
-            liveT("taskUI.moveFailures", {
-              count: failed.length,
-              details: details,
-              more: failed.length > 3 ? liveT("taskUI.andMore") : "",
-            }),
+            failed.length > 3
+              ? t("{count} tasks could not be moved: {details} and more", { count: failed.length, details })
+              : t("{count} tasks could not be moved: {details}", { count: failed.length, details }),
           );
         }
         refreshCategoriesAndTasks();
       } catch (error) {
-        toast.error(liveT("taskUI.categoryChangeFailed", { message: taskError(error, liveT) }));
+        toast.error(t("Failed to change category: {error}", { error: (error as Error).message }));
       } finally {
         setMovingCategory(false);
       }
     },
-    [movingCategory, refreshCategoriesAndTasks, selectedIds, liveT],
+    [movingCategory, refreshCategoriesAndTasks, selectedIds],
   );
 
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
       <TabsList className="mx-4 lg:mx-6">
-        <TabsTrigger value="current">{translate("taskUI.currentTasks")}</TabsTrigger>
-        <TabsTrigger value="archived">{translate("taskUI.archived")}</TabsTrigger>
+        <TabsTrigger value="current">{t("Current tasks")}</TabsTrigger>
+        <TabsTrigger value="archived">{t("Archived")}</TabsTrigger>
       </TabsList>
       <TabsContent value="current">
         <Card>
@@ -965,7 +835,7 @@ export default function TasksPage() {
               <div className="relative w-full sm:max-w-xs">
                 <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
                 <Input
-                  placeholder={translate("taskUI.search")}
+                  placeholder={t("Search description / goal / ID")}
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   className="pl-8"
@@ -974,7 +844,7 @@ export default function TasksPage() {
                   <button
                     type="button"
                     onClick={() => setQuery("")}
-                    aria-label={translate("taskUI.clearSearch")}
+                    aria-label={t("Clear search")}
                     className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2"
                   >
                     <XIcon className="size-4" />
@@ -983,14 +853,14 @@ export default function TasksPage() {
               </div>
               <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as TaskStatus | "all")}>
                 <SelectTrigger className="w-36">
-                  <SelectValue placeholder={translate("taskUI.status")} />
+                  <SelectValue placeholder={t("Status")} />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value="all">{translate("taskUI.allStates")}</SelectItem>
+                    <SelectItem value="all">{t("All statuses")}</SelectItem>
                     {STATUS_OPTIONS.map((s) => (
                       <SelectItem key={s.value} value={s.value}>
-                        {translate(s.label)}
+                        {s.label}
                       </SelectItem>
                     ))}
                   </SelectGroup>
@@ -998,12 +868,12 @@ export default function TasksPage() {
               </Select>
               <Select value={categoryFilter} onValueChange={setCategoryFilter}>
                 <SelectTrigger className="w-40">
-                  <SelectValue placeholder={translate("taskUI.category")} />
+                  <SelectValue placeholder={t("Task category")} />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value="all">{translate("taskUI.allCategories")}</SelectItem>
-                    <SelectItem value={UNCATEGORIZED_VALUE}>{translate("taskUI.uncategorized")}</SelectItem>
+                    <SelectItem value="all">{t("All categories")}</SelectItem>
+                    <SelectItem value={UNCATEGORIZED_VALUE}>{t("Uncategorized")}</SelectItem>
                     {categories.map((category) => (
                       <SelectItem key={category.id} value={String(category.id)}>
                         {category.name}
@@ -1013,15 +883,13 @@ export default function TasksPage() {
                 </SelectContent>
               </Select>
               <span className="text-muted-foreground text-xs tabular-nums">
-                {translate("taskUI.filteredCount", { visible: filtered.length, total: tasks.length })}
+                {t("{shown}/{total} tasks", { shown: filtered.length, total: tasks.length })}
               </span>
               {selectedIds.size > 0 && (
                 <>
-                  <span className="text-xs tabular-nums">
-                    {translate("taskUI.selectedCount", { count: selectedIds.size })}
-                  </span>
+                  <span className="text-xs tabular-nums">{t("{count} selected", { count: selectedIds.size })}</span>
                   <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>
-                    {translate("taskUI.deselect")}
+                    {t("Clear selection")}
                   </Button>
                   {pausableTaskIDs.length > 0 && (
                     <Button
@@ -1035,8 +903,7 @@ export default function TasksPage() {
                       ) : (
                         <PauseIcon data-icon="inline-start" />
                       )}
-                      {translate("taskUI.pause")}
-                      {pausableTaskIDs.length}
+                      {t("Pause {count}", { count: pausableTaskIDs.length })}
                     </Button>
                   )}
                   {resumableTaskIDs.length > 0 && (
@@ -1051,8 +918,7 @@ export default function TasksPage() {
                       ) : (
                         <PlayIcon data-icon="inline-start" />
                       )}
-                      {translate("taskUI.resume")}
-                      {resumableTaskIDs.length}
+                      {t("Resume {count}", { count: resumableTaskIDs.length })}
                     </Button>
                   )}
                   {archivableTaskIDs.length > 0 && (
@@ -1062,8 +928,7 @@ export default function TasksPage() {
                       trigger={
                         <Button size="sm" variant="outline">
                           <ArchiveIcon data-icon="inline-start" />
-                          {translate("taskUI.archive")}
-                          {archivableTaskIDs.length}
+                          {t("Archive {count}", { count: archivableTaskIDs.length })}
                         </Button>
                       }
                     />
@@ -1077,7 +942,6 @@ export default function TasksPage() {
                   <BulkDeleteTasksDialog ids={[...selectedIds]} onDelete={deleteTasks} />
                 </>
               )}
-              <TaskColumnsSettingsDialog visibleColumns={visibleColumns} onChange={setVisibleColumns} />
               <ConcurrencySettingsDialog />
               <CategoryManagementSheet
                 categories={categories}
@@ -1095,11 +959,11 @@ export default function TasksPage() {
 
             {tasks.length === 0 ? (
               <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
-                {translate("taskUI.empty")}
+                {t("No tasks yet. Click \"New task\" at the top right to start.")}
               </div>
             ) : filtered.length === 0 ? (
               <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
-                {translate("taskUI.noMatches")}
+                {t("No matching tasks.")}
               </div>
             ) : (
               <Table className="**:data-[slot='table-cell']:px-4 **:data-[slot='table-head']:px-4">
@@ -1109,7 +973,7 @@ export default function TasksPage() {
                       <Checkbox
                         checked={headerChecked}
                         onCheckedChange={(checked) => toggleSelectedPage(checked === true)}
-                        aria-label={translate("taskUI.selectPage")}
+                        aria-label={t("Select all tasks on this page")}
                       />
                     </TableHead>
                     <SortableTaskHead
@@ -1118,39 +982,26 @@ export default function TasksPage() {
                       activeField={sortField}
                       direction={sortDirection}
                       className="font-mono"
-                      hidden={!visibleColumns.id}
                       onSort={sortTasksBy}
                     />
-                    <TableHead className={cn(!visibleColumns.name && "hidden")}>{translate("taskUI.name")}</TableHead>
-                    <TableHead className={cn("w-px", !visibleColumns.remark && "hidden")}>
-                      {translate("taskUI.remark")}
-                    </TableHead>
-                    <TableHead className={cn(!visibleColumns.description && "hidden")}>
-                      {translate("taskUI.description")}
-                    </TableHead>
-                    <TableHead className={cn(!visibleColumns.goal && "hidden")}>{translate("taskUI.goal")}</TableHead>
+                    <TableHead>{t("Name")}</TableHead>
+                    <TableHead>{t("Description")}</TableHead>
+                    <TableHead>{t("Goal")}</TableHead>
                     <SortableTaskHead
                       field="status"
-                      label={translate("taskUI.status")}
-                      hidden={!visibleColumns.status}
+                      label={t("Status")}
                       activeField={sortField}
                       direction={sortDirection}
                       onSort={sortTasksBy}
                     />
-                    <TableHead className={cn("text-center", !visibleColumns.progress && "hidden")}>
-                      {translate("taskUI.progress")}
+                    <TableHead className="text-center">{t("Goal progress")}</TableHead>
+                    <TableHead className="text-center" title={t("Critical / High / Medium / Low")}>
+                      {t("Findings")} <span className="text-muted-foreground font-normal">{t("C/H/M/L")}</span>
                     </TableHead>
-                    <TableHead className="text-center" title={translate("taskUI.findingSeverity")}>
-                      {translate("taskUI.findings")}{" "}
-                      <span className="text-muted-foreground font-normal">{translate("taskUI.severityShort")}</span>
-                    </TableHead>
-                    <TableHead className={cn("text-center", !visibleColumns.inFlight && "hidden")}>
-                      {translate("taskUI.workers")}
-                    </TableHead>
+                    <TableHead className="text-center">{t("Running workers")}</TableHead>
                     <SortableTaskHead
                       field="created"
-                      label={translate("taskUI.createdAt")}
-                      hidden={!visibleColumns.created}
+                      label={t("Created at")}
                       activeField={sortField}
                       direction={sortDirection}
                       align="right"
@@ -1158,16 +1009,15 @@ export default function TasksPage() {
                     />
                     <SortableTaskHead
                       field="duration"
-                      label={translate("taskUI.duration")}
-                      hidden={!visibleColumns.duration}
+                      label={t("Duration")}
                       activeField={sortField}
                       direction={sortDirection}
                       align="right"
                       onSort={sortTasksBy}
                     />
-                    <TableHead className={cn("text-right", !visibleColumns.tokens && "hidden")}>Token</TableHead>
+                    <TableHead className="text-right">{t("Token")}</TableHead>
                     <TableHead className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))]">
-                      {translate("taskUI.actions")}
+                      {t("Actions")}
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -1176,19 +1026,16 @@ export default function TasksPage() {
                     <TaskRow
                       key={task.id}
                       task={task}
-                      // running 任务才吃 nowSec;其余行传 0 —— props 不变,memo 就能拦下每秒 tick
-                      // 带来的整表重渲染,只让在跑的那几行走时长。
+                      // only running tasks consume nowSec; other rows get 0 — with unchanged props, memo blocks the per-second tick's
+                      // whole-table re-render and only the running rows advance their duration.
                       nowSec={task.status === "running" ? nowSec : 0}
                       onDelete={deleteTask}
                       onControl={controlTask}
                       onRename={renameTask}
-                      onRemark={updateTaskRemark}
                       onTogglePinned={toggleTaskPinned}
-                      onToggleGlobalAssets={toggleTaskGlobalAssets}
                       onArchive={queueTaskArchive}
                       selected={selectedIds.has(task.id)}
                       onSelectedChange={toggleSelected}
-                      visibleColumns={visibleColumns}
                     />
                   ))}
                 </TableBody>
@@ -1229,7 +1076,6 @@ function SortableTaskHead({
   direction,
   align = "left",
   className,
-  hidden = false,
   onSort,
 }: {
   field: TaskSortField;
@@ -1238,23 +1084,22 @@ function SortableTaskHead({
   direction: SortDirection;
   align?: "left" | "right";
   className?: string;
-  hidden?: boolean;
   onSort: (field: TaskSortField) => void;
 }) {
-  const { t: translate } = useLiveTranslation();
   const active = activeField === field;
   let ariaSort: React.AriaAttributes["aria-sort"] = "none";
   if (active) ariaSort = direction === "asc" ? "ascending" : "descending";
 
-  let actionLabel = translate("taskUI.sortDescending", { label: label });
-  if (active)
-    actionLabel = translate("taskUI.sortCurrent", {
-      label: label,
-      direction: direction === "asc" ? translate("taskUI.ascending") : translate("taskUI.descending"),
-    });
+  let actionLabel = t("Sort by {label} descending", { label });
+  if (active) {
+    actionLabel =
+      direction === "asc"
+        ? t("{label} is currently ascending; click to toggle sort direction", { label })
+        : t("{label} is currently descending; click to toggle sort direction", { label });
+  }
 
   return (
-    <TableHead className={cn(className, hidden && "hidden")} aria-sort={ariaSort}>
+    <TableHead className={className} aria-sort={ariaSort}>
       <button
         type="button"
         className={cn(
@@ -1271,61 +1116,7 @@ function SortableTaskHead({
   );
 }
 
-function TaskColumnsSettingsDialog({
-  visibleColumns,
-  onChange,
-}: {
-  visibleColumns: Record<TaskColumnKey, boolean>;
-  onChange: React.Dispatch<React.SetStateAction<Record<TaskColumnKey, boolean>>>;
-}) {
-  const { t: translate } = useLiveTranslation();
-  const [open, setOpen] = React.useState(false);
-  const visibleCount = TASK_COLUMNS.filter(({ key }) => visibleColumns[key]).length;
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button size="sm" variant="outline" aria-label={translate("taskUI.columnsSettings")}>
-          <TablePropertiesIcon /> {translate("taskUI.columns")}
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{translate("taskUI.columnsSettings")}</DialogTitle>
-          <DialogDescription>{translate("taskUI.columnsHelp")}</DialogDescription>
-        </DialogHeader>
-        <div className="grid grid-cols-2 gap-3 py-2">
-          {TASK_COLUMNS.map(({ key, label }) => (
-            <div key={key} className="flex items-center gap-2 text-sm">
-              <Checkbox
-                id={`task-column-${key}`}
-                checked={visibleColumns[key]}
-                disabled={visibleColumns[key] && visibleCount === 1}
-                onCheckedChange={(checked) =>
-                  onChange((current) => ({
-                    ...current,
-                    [key]: checked === true,
-                  }))
-                }
-              />
-              <label htmlFor={`task-column-${key}`}>{translate(label)}</label>
-            </div>
-          ))}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onChange(DEFAULT_TASK_COLUMNS)}>
-            {translate("taskUI.reset")}
-          </Button>
-          <DialogClose asChild>
-            <Button>{translate("taskUI.finish")}</Button>
-          </DialogClose>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 function ConcurrencySettingsDialog() {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [enabled, setEnabled] = React.useState(false);
   const [limit, setLimit] = React.useState("5");
@@ -1351,18 +1142,15 @@ function ConcurrencySettingsDialog() {
     const nextLimit = Math.max(1, Math.floor(Number(limit) || 5));
     setSaving(true);
     try {
-      await api.setSettings({
-        task_concurrency_enabled: enabled,
-        task_concurrency_limit: nextLimit,
-      });
+      await api.setSettings({ task_concurrency_enabled: enabled, task_concurrency_limit: nextLimit });
       toast.success(
         enabled
-          ? translate("taskUI.concurrencyEnabled", { count: nextLimit })
-          : translate("taskUI.concurrencyDisabled"),
+          ? t("Concurrency limit enabled: at most {count} tasks can run simultaneously", { count: nextLimit })
+          : t("Task concurrency limit disabled"),
       );
       setOpen(false);
     } catch (error) {
-      toast.error(translate("taskUI.saveFailed", { message: taskError(error, translate) }));
+      toast.error(t("Save failed: {error}", { error: (error as Error).message }));
     } finally {
       setSaving(false);
     }
@@ -1371,26 +1159,30 @@ function ConcurrencySettingsDialog() {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button size="sm" variant="outline" className="ml-auto" aria-label={translate("taskUI.concurrencySettings")}>
-          <SlidersHorizontalIcon /> {translate("taskUI.concurrency")}
+        <Button size="sm" variant="outline" className="ml-auto" aria-label={t("Task concurrency settings")}>
+          <SlidersHorizontalIcon /> {t("Concurrency")}
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{translate("taskUI.concurrencyLimit")}</DialogTitle>
-          <DialogDescription>{translate("taskUI.concurrencyHelp")}</DialogDescription>
+          <DialogTitle>{t("Task concurrency limit")}</DialogTitle>
+          <DialogDescription>
+            {t(
+              "Limit how many tasks can run simultaneously. Once the limit is reached, new tasks queue in creation order and start automatically as slots free up.",
+            )}
+          </DialogDescription>
         </DialogHeader>
         <div className="grid gap-5 py-2">
           <div className="flex items-center justify-between gap-4">
             <div className="grid gap-1">
-              <Label htmlFor="task-concurrency-enabled">{translate("taskUI.enableConcurrency")}</Label>
-              <span className="text-muted-foreground text-xs">{translate("taskUI.offByDefault")}</span>
+              <Label htmlFor="task-concurrency-enabled">{t("Enable task concurrency limit")}</Label>
+              <span className="text-muted-foreground text-xs">{t("Off by default")}</span>
             </div>
             <Switch id="task-concurrency-enabled" checked={enabled} onCheckedChange={setEnabled} disabled={loading} />
           </div>
           {enabled && (
             <div className="grid gap-2">
-              <Label htmlFor="task-concurrency-limit">{translate("taskUI.maxConcurrent")}</Label>
+              <Label htmlFor="task-concurrency-limit">{t("Max concurrent tasks")}</Label>
               <Input
                 id="task-concurrency-limit"
                 type="number"
@@ -1405,10 +1197,10 @@ function ConcurrencySettingsDialog() {
         </div>
         <DialogFooter>
           <DialogClose asChild>
-            <Button variant="outline">{translate("taskUI.cancel")}</Button>
+            <Button variant="outline">{t("Cancel")}</Button>
           </DialogClose>
           <Button onClick={save} disabled={loading || saving}>
-            {saving && <Loader2Icon className="animate-spin" />} {translate("taskUI.save")}
+            {saving && <Loader2Icon className="animate-spin" />} {t("Save")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1416,7 +1208,7 @@ function ConcurrencySettingsDialog() {
   );
 }
 
-// TaskRow renders one row of the task table. Memoized so the per-second 运行时长 tick and
+// TaskRow renders one row of the task table. Memoized so the per-second duration tick and
 // the POLL_MS list refresh only re-render the rows whose data actually moved — a table page
 // is 20 rows × (StatusBadge + Link + a Radix AlertDialog tree), far too heavy to rebuild
 // wholesale on every parent render.
@@ -1426,57 +1218,41 @@ const TaskRow = React.memo(function TaskRow({
   onDelete,
   onControl,
   onRename,
-  onRemark,
   onTogglePinned,
-  onToggleGlobalAssets,
   onArchive,
   selected,
   onSelectedChange,
-  visibleColumns,
 }: {
   task: Task;
   nowSec: number;
   onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
   onControl: (id: string, action: "pause" | "resume") => Promise<void>;
   onRename: (task: Task, name: string) => Promise<void>;
-  onRemark: (task: Task, remark: string) => Promise<void>;
   onTogglePinned: (task: Task) => Promise<void>;
-  onToggleGlobalAssets: (task: Task) => Promise<void>;
   onArchive: (task: Task) => Promise<void>;
   selected: boolean;
   onSelectedChange: (id: string, checked: boolean) => void;
-  visibleColumns: Record<TaskColumnKey, boolean>;
 }) {
-  const { t: translate, i18n } = useLiveTranslation();
   return (
     <TableRow className="group border-border/60" data-state={selected ? "selected" : undefined}>
       <TableCell>
         <Checkbox
           checked={selected}
           onCheckedChange={(checked) => onSelectedChange(task.id, checked === true)}
-          aria-label={translate("taskUI.selectTask", { id: task.id })}
+          aria-label={t("Select task {id}", { id: task.id })}
         />
       </TableCell>
-      <TableCell className={cn(!visibleColumns.id && "hidden")}>
+      <TableCell>
         <code className="bg-muted rounded px-1.5 py-0.5 font-mono text-xs">{task.id}</code>
       </TableCell>
-      <TableCell className={cn("font-medium", !visibleColumns.name && "hidden")}>
+      <TableCell className="font-medium">
         <div className="flex max-w-xs items-center gap-2">
           <TaskNameEditor task={task} onRename={onRename} />
           {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
-          {taskIsPinned(task) && (
-            <PinIcon className="text-primary size-4 shrink-0" aria-label={translate("taskUI.pinned")} />
-          )}
+          {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label={t("Pinned")} />}
         </div>
       </TableCell>
-      <TableCell className={cn(!visibleColumns.remark && "hidden")}>
-        <RemarkEditor
-          value={task.remark}
-          label={translate("taskUI.taskId", { id: task.id })}
-          onSave={(remark) => onRemark(task, remark)}
-        />
-      </TableCell>
-      <TableCell className={cn("text-muted-foreground max-w-40", !visibleColumns.description && "hidden")}>
+      <TableCell className="text-muted-foreground max-w-40">
         <Link
           href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
           className="block truncate rounded-sm hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -1488,35 +1264,26 @@ const TaskRow = React.memo(function TaskRow({
       <TableCell className="text-muted-foreground max-w-40 truncate" title={task.goal}>
         {task.goal}
       </TableCell>
-      <TableCell className={cn(!visibleColumns.status && "hidden")}>
-        <StatusBadge domain="task" value={task.status} stopReason={task.stop_reason} dot />
+      <TableCell>
+        <StatusBadge domain="task" value={task.status} dot />
       </TableCell>
-      <TableCell
-        className={cn("text-muted-foreground text-center text-xs tabular-nums", !visibleColumns.progress && "hidden")}
-      >
+      <TableCell className="text-muted-foreground text-center text-xs tabular-nums">
         {typeof task.goals_total === "number" && task.goals_total > 0 ? (
           `${task.goals_met}/${task.goals_total}`
         ) : (
           <span className="text-muted-foreground">—</span>
         )}
       </TableCell>
-      <TableCell className={cn("text-center text-xs tabular-nums", !visibleColumns.findings && "hidden")}>
+      <TableCell className="text-center text-xs tabular-nums">
         {(() => {
-          // Keep report severity counts visible while a merged folder awaits its own assessment.
-          const f = task.findings ?? task.distinct_findings;
+          const f = task.findings;
           const total = f ? f.critical + f.high + f.medium + f.low : 0;
-          if (!f || (total === 0 && !task.distinct_findings?.total))
-            return <span className="text-muted-foreground">0</span>;
-          const seg = (n: number, cls: string) => <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>;
+          if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
+          const seg = (n: number, cls: string) => (
+            <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
+          );
           return (
-            <span
-              className="font-medium whitespace-nowrap"
-              title={translate("taskUI.findingSummary", {
-                source: task.findings ? translate("taskUI.rawReports") : translate("taskUI.distinctFindings"),
-                reports: task.distinct_findings?.reports ?? total,
-                pending: task.distinct_findings?.unassessed ?? 0,
-              })}
-            >
+            <span className="font-medium whitespace-nowrap" title={t("Critical / High / Medium / Low")}>
               {seg(f.critical, "text-rose-600 dark:text-rose-400")}
               <span className="text-muted-foreground">/</span>
               {seg(f.high, "text-red-600 dark:text-red-400")}
@@ -1524,39 +1291,21 @@ const TaskRow = React.memo(function TaskRow({
               {seg(f.medium, "text-amber-600 dark:text-amber-400")}
               <span className="text-muted-foreground">/</span>
               {seg(f.low, "text-slate-600 dark:text-slate-400")}
-              {task.distinct_findings ? (
-                <span className="ml-1 text-muted-foreground">
-                  {translate("taskUI.findingCounts", {
-                    count: task.distinct_findings.total,
-                    reports: task.distinct_findings.reports,
-                  })}
-                  {task.distinct_findings.unassessed > 0
-                    ? translate("taskUI.unassessed", { count: task.distinct_findings.unassessed })
-                    : ""}
-                </span>
-              ) : null}
             </span>
           );
         })()}
       </TableCell>
-      <TableCell className={cn("text-center text-xs tabular-nums", !visibleColumns.inFlight && "hidden")}>
+      <TableCell className="text-center text-xs tabular-nums">
         {task.in_flight && task.in_flight > 0 ? (
           <span className="text-foreground font-medium">{task.in_flight}</span>
         ) : (
           <span className="text-muted-foreground">0</span>
         )}
       </TableCell>
-      <TableCell
-        className={cn(
-          "text-muted-foreground text-right text-xs whitespace-nowrap tabular-nums",
-          !visibleColumns.created && "hidden",
-        )}
-      >
-        {fmtDateTime(task.created_unix, i18n.resolvedLanguage ?? "zh-CN")}
+      <TableCell className="text-muted-foreground text-right text-xs whitespace-nowrap tabular-nums">
+        {fmtDateTime(task.created_unix)}
       </TableCell>
-      <TableCell
-        className={cn("text-right text-xs whitespace-nowrap tabular-nums", !visibleColumns.duration && "hidden")}
-      >
+      <TableCell className="text-right text-xs whitespace-nowrap tabular-nums">
         {(() => {
           const secs = taskDuration(task, nowSec);
           if (secs <= 0) return <span className="text-muted-foreground">—</span>;
@@ -1568,10 +1317,10 @@ const TaskRow = React.memo(function TaskRow({
         })()}
       </TableCell>
       <TableCell
-        className={cn("text-right text-xs whitespace-nowrap tabular-nums", !visibleColumns.tokens && "hidden")}
+        className="text-right text-xs whitespace-nowrap tabular-nums"
         title={
           task.tokens
-            ? translate("taskUI.tokens", {
+            ? t("Input {input} · Cache {cache} · Output {output}", {
                 input: task.tokens.input_tokens,
                 cache: task.tokens.cache_read_tokens,
                 output: task.tokens.output_tokens,
@@ -1581,11 +1330,11 @@ const TaskRow = React.memo(function TaskRow({
       >
         {task.tokens ? (
           <span className="text-muted-foreground">
-            {translate("taskUI.inputShort")}{" "}
-            <span className="text-foreground">{fmtTokens(task.tokens.input_tokens)}</span>
-            {translate("taskUI.cacheShort")}
-            <span className="text-foreground">{fmtTokens(task.tokens.cache_read_tokens)}</span>
-            {translate("taskUI.outputShort")}
+            {t("In")} <span className="text-foreground">{fmtTokens(task.tokens.input_tokens)}</span>
+            {" · "}
+            {t("Cache")} <span className="text-foreground">{fmtTokens(task.tokens.cache_read_tokens)}</span>
+            {" · "}
+            {t("Out")}{" "}
             <span className="text-foreground">{fmtTokens(task.tokens.output_tokens)}</span>
           </span>
         ) : (
@@ -1594,14 +1343,11 @@ const TaskRow = React.memo(function TaskRow({
       </TableCell>
       <TableCell className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))] group-hover:bg-muted/50">
         <div className="flex items-center justify-end gap-0.5">
-          <TaskGlobalAssetsAction task={task} onToggle={onToggleGlobalAssets} />
-          <TaskActionTooltip label={translate("taskUI.viewTask")} description={translate("taskUI.viewTaskHelp")}>
-            <Button size="icon" variant="ghost" asChild aria-label={translate("taskUI.viewTask")}>
-              <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}>
-                <EyeIcon />
-              </Link>
-            </Button>
-          </TaskActionTooltip>
+          <Button size="icon" variant="ghost" asChild aria-label={t("View task details")} title={t("View task details")}>
+            <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}>
+              <EyeIcon />
+            </Link>
+          </Button>
           <TaskControlButton task={task} onControl={onControl} />
           <TaskPinAction task={task} onTogglePinned={onTogglePinned} />
           <TaskArchiveAction task={task} onArchive={onArchive} />
@@ -1612,30 +1358,7 @@ const TaskRow = React.memo(function TaskRow({
   );
 });
 
-function TaskActionTooltip({
-  label,
-  description,
-  children,
-  disabled = false,
-}: {
-  label: string;
-  description: string;
-  children: React.ReactElement;
-  disabled?: boolean;
-}) {
-  return (
-    <Tooltip delayDuration={200}>
-      <TooltipTrigger asChild>{disabled ? <span className="inline-flex">{children}</span> : children}</TooltipTrigger>
-      <TooltipContent side="top" sideOffset={6} className="block max-w-64 space-y-1 text-left leading-relaxed">
-        <p className="font-medium">{label}</p>
-        <p>{description}</p>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
 function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task, name: string) => Promise<void> }) {
-  const { t: translate } = useLiveTranslation();
   const [editing, setEditing] = React.useState(false);
   const [name, setName] = React.useState(task.name ?? "");
   const [saving, setSaving] = React.useState(false);
@@ -1681,7 +1404,7 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
           maxLength={200}
           autoFocus
           disabled={saving}
-          aria-label={translate("taskUI.taskNameLabel", { id: task.id })}
+          aria-label={t("Task #{id} name", { id: task.id })}
           className="h-7 min-w-28 max-w-48 px-2 font-medium"
           onFocus={(event) => event.currentTarget.select()}
           onChange={(event) => setName(event.target.value)}
@@ -1709,23 +1432,22 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
         className="min-w-0 truncate rounded-sm hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         title={task.name?.trim() ? task.name : task.description}
       >
-        {task.name?.trim() ? task.name : <span className="text-muted-foreground">{translate("taskUI.untitled")}</span>}
+        {task.name?.trim() ? task.name : <span className="text-muted-foreground">{t("Unnamed")}</span>}
       </Link>
-      <TaskActionTooltip label={translate("taskUI.rename")} description={translate("taskUI.renameHelp")}>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          className="shrink-0 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100"
-          aria-label={translate("taskUI.renameTaskId", { id: task.id })}
-          onClick={() => {
-            setName(task.name ?? "");
-            setEditing(true);
-          }}
-        >
-          <PencilIcon />
-        </Button>
-      </TaskActionTooltip>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        className="shrink-0 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100"
+        aria-label={t("Rename task #{id}", { id: task.id })}
+        title={t("Rename")}
+        onClick={() => {
+          setName(task.name ?? "");
+          setEditing(true);
+        }}
+      >
+        <PencilIcon />
+      </Button>
     </div>
   );
 }
@@ -1737,93 +1459,40 @@ function taskPinIcon(pinning: boolean, pinned: boolean) {
 }
 
 function TaskPinAction({ task, onTogglePinned }: { task: Task; onTogglePinned: (task: Task) => Promise<void> }) {
-  const { t: translate } = useLiveTranslation();
   const [pinning, setPinning] = React.useState(false);
   const pinned = taskIsPinned(task);
 
   return (
-    <TaskActionTooltip
-      label={pinned ? translate("taskUI.unpin") : translate("taskUI.pin")}
-      description={pinned ? translate("taskUI.unpinHelp") : translate("taskUI.pinHelp")}
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
       disabled={pinning}
-    >
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        disabled={pinning}
-        aria-label={
-          pinned ? translate("taskUI.unpinTaskId", { id: task.id }) : translate("taskUI.pinTaskId", { id: task.id })
+      aria-label={pinned ? t("Unpin task #{id}", { id: task.id }) : t("Pin task #{id}", { id: task.id })}
+      title={pinned ? t("Unpin") : t("Pin")}
+      onClick={async () => {
+        setPinning(true);
+        try {
+          await onTogglePinned(task);
+        } finally {
+          setPinning(false);
         }
-        onClick={async () => {
-          setPinning(true);
-          try {
-            await onTogglePinned(task);
-          } finally {
-            setPinning(false);
-          }
-        }}
-      >
-        {taskPinIcon(pinning, pinned)}
-      </Button>
-    </TaskActionTooltip>
+      }}
+    >
+      {taskPinIcon(pinning, pinned)}
+    </Button>
   );
 }
 
-function taskGlobalAssetsIcon(saving: boolean, enabled: boolean) {
-  if (saving) return <Loader2Icon className="animate-spin" />;
-  if (enabled) return <GlobeIcon />;
-  return <GlobeOffIcon />;
-}
-
-function TaskGlobalAssetsAction({ task, onToggle }: { task: Task; onToggle: (task: Task) => Promise<void> }) {
-  const { t: translate } = useLiveTranslation();
-  const [saving, setSaving] = React.useState(false);
-  const enabled = task.share_global_assets === true;
-  const label = translate("taskUI.shareStateLabel", {
-    state: enabled ? translate("taskUI.shareOnLabel") : translate("taskUI.shareOffLabel"),
-  });
-  return (
-    <Tooltip delayDuration={200}>
-      <TooltipTrigger asChild>
-        <Button
-          size="icon"
-          variant="ghost"
-          aria-label={label}
-          aria-pressed={enabled}
-          aria-busy={saving}
-          className={enabled ? "text-foreground" : "text-muted-foreground"}
-          disabled={saving}
-          onClick={async () => {
-            setSaving(true);
-            try {
-              await onToggle(task);
-            } finally {
-              setSaving(false);
-            }
-          }}
-        >
-          {taskGlobalAssetsIcon(saving, enabled)}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent side="top" sideOffset={6} className="block max-w-64 space-y-1 text-left leading-relaxed">
-        <p className="font-medium">{translate(enabled ? "taskUI.sharingOn" : "taskUI.sharingOff")}</p>
-        <p>{translate("taskUI.shareHelp")}</p>
-        <p className="opacity-75">{enabled ? translate("taskUI.stopSharing") : translate("taskUI.startSharing")}</p>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-// 三态图标分开写而非嵌套三元:仓库 Biome 基线禁 noNestedTernary。
+// The three-state icon is written as separate branches instead of a nested ternary: the repo's Biome baseline bans noNestedTernary.
 function taskControlIcon(pending: boolean, action: "pause" | "resume" | null) {
   if (pending) return <Loader2Icon className="animate-spin" />;
   if (action === "resume") return <PlayIcon />;
   return <PauseIcon />;
 }
 
-// TaskControlButton 是行内的暂停/继续开关。终态任务渲染为 disabled 而不是隐藏,
-// 这样各行操作列宽度一致,按钮位置不会随状态跳动。
+// TaskControlButton is the inline pause/resume toggle. Terminal tasks render disabled rather than hidden,
+// so every row's action column keeps a consistent width and buttons don't jump around with status.
 function TaskControlButton({
   task,
   onControl,
@@ -1831,41 +1500,38 @@ function TaskControlButton({
   task: Task;
   onControl: (id: string, action: "pause" | "resume") => Promise<void>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [pending, setPending] = React.useState(false);
   const action = taskControlAction(task.status);
-  const label = action === "resume" ? translate("taskUI.resumeTask") : translate("taskUI.pauseTask");
-  let description = translate("taskUI.pauseHelp");
-  if (action === "resume") description = translate("taskUI.resumeHelp");
-  if (!action) description = translate("taskUI.controlUnavailable");
+  const label = action === "resume" ? t("Resume task") : t("Pause task");
   return (
-    <TaskActionTooltip label={label} description={description} disabled={!action || pending}>
-      <Button
-        size="icon"
-        variant="ghost"
-        aria-label={label}
-        disabled={!action || pending}
-        onClick={async () => {
-          if (!action) return;
-          setPending(true);
-          try {
-            await onControl(task.id, action);
-          } finally {
-            setPending(false);
-          }
-        }}
-      >
-        {taskControlIcon(pending, action)}
-      </Button>
-    </TaskActionTooltip>
+    <Button
+      size="icon"
+      variant="ghost"
+      aria-label={label}
+      title={action ? label : t("Cannot pause or resume in this state")}
+      disabled={!action || pending}
+      onClick={async () => {
+        if (!action) return;
+        setPending(true);
+        try {
+          await onControl(task.id, action);
+        } finally {
+          setPending(false);
+        }
+      }}
+    >
+      {taskControlIcon(pending, action)}
+    </Button>
   );
 }
 
-function archiveBlockReason(task: Task, translate: TFunction): string {
-  if (task.queued) return translate("taskUI.pauseQueuedFirst");
-  if (!ARCHIVABLE_STATUSES.has(task.status)) return translate("taskUI.pauseActiveFirst");
+function archiveBlockReason(task: Task): string {
+  if (task.queued) return t("Queued tasks must be paused first");
+  if (!ARCHIVABLE_STATUSES.has(task.status)) return t("Running or unfinished tasks must be paused first");
   if (task.archive_blocked_by_task_id) {
-    return translate("taskUI.archiveDependency", { id: task.archive_blocked_by_task_id });
+    return t("The task is directly inherited by unarchived task #{id}; archive the dependent task first", {
+      id: task.archive_blocked_by_task_id,
+    });
   }
   return "";
 }
@@ -1879,7 +1545,6 @@ function ArchiveConfirmDialog({
   trigger: React.ReactNode;
   onConfirm: () => Promise<void>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [pending, setPending] = React.useState(false);
   return (
@@ -1887,15 +1552,15 @@ function ArchiveConfirmDialog({
       <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>
-            {count === 1 ? translate("taskUI.archiveTask") : translate("taskUI.archiveTasks", { count: count })}
-          </AlertDialogTitle>
+          <AlertDialogTitle>{count === 1 ? t("Archive task") : t("Archive {count} tasks", { count })}</AlertDialogTitle>
           <AlertDialogDescription className="[overflow-wrap:anywhere]">
-            {translate("taskUI.archiveHelp")}
+            {t(
+              "Archiving stops task scheduling and compresses the graph, LLM history, files, and exclusive assets and traffic into local cold storage. Once archived, a task can be restored from \"Archived\".",
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={pending}>{translate("taskUI.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel disabled={pending}>{t("Cancel")}</AlertDialogCancel>
           <AlertDialogAction
             disabled={pending}
             onClick={async (event) => {
@@ -1910,7 +1575,7 @@ function ArchiveConfirmDialog({
             }}
           >
             {pending && <Spinner data-icon="inline-start" />}
-            {translate("taskUI.confirmArchive")}
+            {t("Confirm archive")}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -1919,38 +1584,23 @@ function ArchiveConfirmDialog({
 }
 
 function TaskArchiveAction({ task, onArchive }: { task: Task; onArchive: (task: Task) => Promise<void> }) {
-  const { t: translate } = useLiveTranslation();
-  const reason = archiveBlockReason(task, translate);
+  const reason = archiveBlockReason(task);
   const trigger = (
-    <Button
-      size="icon"
-      variant="ghost"
-      disabled={Boolean(reason)}
-      aria-label={translate("taskUI.archiveTaskId", { id: task.id })}
-    >
+    <Button size="icon" variant="ghost" disabled={Boolean(reason)} aria-label={t("Archive task #{id}", { id: task.id })}>
       <ArchiveIcon />
     </Button>
   );
   if (reason) {
     return (
-      <TaskActionTooltip label={translate("taskUI.cannotArchive")} description={reason} disabled>
-        {trigger}
-      </TaskActionTooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex">{trigger}</span>
+        </TooltipTrigger>
+        <TooltipContent>{reason}</TooltipContent>
+      </Tooltip>
     );
   }
-  return (
-    <Tooltip delayDuration={200}>
-      <ArchiveConfirmDialog
-        count={1}
-        trigger={<TooltipTrigger asChild>{trigger}</TooltipTrigger>}
-        onConfirm={() => onArchive(task)}
-      />
-      <TooltipContent side="top" sideOffset={6} className="block max-w-64 space-y-1 text-left leading-relaxed">
-        <p className="font-medium">{translate("taskUI.archiveTask")}</p>
-        <p>{translate("taskUI.archiveTooltip")}</p>
-      </TooltipContent>
-    </Tooltip>
-  );
+  return <ArchiveConfirmDialog count={1} trigger={trigger} onConfirm={() => onArchive(task)} />;
 }
 
 const ARCHIVE_PROCESSING_STATES = new Set<TaskArchiveState>([
@@ -1964,29 +1614,28 @@ const ARCHIVE_PROCESSING_STATES = new Set<TaskArchiveState>([
 
 const ARCHIVE_FAILED_STATES = new Set<TaskArchiveState>(["archive_failed", "restore_failed", "delete_failed"]);
 
-function archiveStateLabel(state: TaskArchiveState, translate: TFunction): string {
+function archiveStateLabel(state: TaskArchiveState): string {
   const labels: Record<TaskArchiveState, string> = {
-    archive_queued: translate("taskUI.archiveQueued"),
-    archiving: translate("taskUI.archiving"),
-    archive_failed: translate("taskUI.archiveFailed"),
-    ready: translate("taskUI.ready"),
-    restore_queued: translate("taskUI.restoreQueued"),
-    restoring: translate("taskUI.restoring"),
-    restore_failed: translate("taskUI.restoreFailed"),
-    delete_queued: translate("taskUI.deleteQueued"),
-    deleting: translate("taskUI.deleting"),
-    delete_failed: translate("taskUI.deleteFailed"),
+    archive_queued: t("Archive queued"),
+    archiving: t("Archiving"),
+    archive_failed: t("Archive failed"),
+    ready: t("Restorable"),
+    restore_queued: t("Restore queued"),
+    restoring: t("Restoring"),
+    restore_failed: t("Restore failed"),
+    delete_queued: t("Delete queued"),
+    deleting: t("Deleting"),
+    delete_failed: t("Delete failed"),
   };
   return labels[state];
 }
 
 function ArchiveStateBadge({ state }: { state: TaskArchiveState }) {
-  const { t: translate } = useLiveTranslation();
   let variant: "default" | "secondary" | "destructive" | "outline" = "outline";
   if (state === "ready") variant = "secondary";
   if (ARCHIVE_PROCESSING_STATES.has(state)) variant = "default";
   if (ARCHIVE_FAILED_STATES.has(state)) variant = "destructive";
-  return <Badge variant={variant}>{archiveStateLabel(state, translate)}</Badge>;
+  return <Badge variant={variant}>{archiveStateLabel(state)}</Badge>;
 }
 
 function formatArchiveBytes(bytes: number): string {
@@ -1997,24 +1646,21 @@ function formatArchiveBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
-function archiveCompressionLabel(archive: TaskArchive, translate: TFunction): string {
+function archiveCompressionLabel(archive: TaskArchive): string {
   if (archive.original_size <= 0 || archive.compressed_size <= 0) return "—";
   const saved = Math.max(0, 100 - (archive.compressed_size / archive.original_size) * 100);
-  return translate("taskUI.compression", {
-    size: formatArchiveBytes(archive.compressed_size),
-    saved: saved.toFixed(0),
-  });
+  return t("{size} · saves {percent}%", { size: formatArchiveBytes(archive.compressed_size), percent: saved.toFixed(0) });
 }
 
 function archiveDataTotal(archive: TaskArchive): number {
   return Object.values(archive.data_counts).reduce((sum, value) => sum + (Number(value) || 0), 0);
 }
 
-function archiveDate(value: string | undefined, locale: string): string {
+function archiveDate(value?: string): string {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleString(locale);
+  return date.toLocaleString(intlLocale);
 }
 
 function ArchiveDeleteDialog({
@@ -2026,7 +1672,6 @@ function ArchiveDeleteDialog({
   onConfirm: () => Promise<void>;
   trigger: React.ReactNode;
 }) {
-  const { t: translate, i18n } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [pending, setPending] = React.useState(false);
   const rows = archives.reduce((sum, archive) => sum + archiveDataTotal(archive), 0);
@@ -2036,16 +1681,16 @@ function ArchiveDeleteDialog({
       <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{translate("taskUI.confirmDeleteArchives", { count: archives.length })}</AlertDialogTitle>
+          <AlertDialogTitle>{t("Permanently delete {count} task archives?", { count: archives.length })}</AlertDialogTitle>
           <AlertDialogDescription className="[overflow-wrap:anywhere]">
-            {translate("taskUI.deleteArchiveDetails", {
-              size: formatArchiveBytes(bytes),
-              rows: rows.toLocaleString(i18n.resolvedLanguage),
-            })}
+            {t(
+              "About {size} of archive packages and {rows} related data snapshots will be permanently deleted. This action cannot be undone.",
+              { size: formatArchiveBytes(bytes), rows: rows.toLocaleString(intlLocale) },
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={pending}>{translate("taskUI.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel disabled={pending}>{t("Cancel")}</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
             disabled={pending}
@@ -2061,7 +1706,7 @@ function ArchiveDeleteDialog({
             }}
           >
             {pending && <Spinner data-icon="inline-start" />}
-            {translate("taskUI.permanentDelete")}
+            {t("Delete permanently")}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -2070,7 +1715,6 @@ function ArchiveDeleteDialog({
 }
 
 function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
-  const { t: translate, liveT, i18n } = useLiveTranslation();
   const [archives, setArchives] = React.useState<TaskArchive[]>([]);
   const [query, setQuery] = React.useState("");
   const [stateFilter, setStateFilter] = React.useState("all");
@@ -2101,23 +1745,23 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
         let restored = false;
         states.forEach((state, index) => {
           if (state.status !== "rejected" || !(state.reason instanceof Error)) return;
-          if (!state.reason.message.includes(liveT("taskUI.archiveNotFound"))) return;
+          if (!state.reason.message.includes("archive not found")) return;
           pendingRestoreIDs.current.delete(pending[index]);
           restored = true;
         });
         if (restored) onChanged();
       }
     } catch (error) {
-      toast.error(liveT("taskUI.loadArchivesFailed", { message: taskError(error, liveT) }));
+      toast.error(t("Failed to load the archive list: {error}", { error: (error as Error).message }));
     } finally {
       setLoading(false);
     }
-  }, [onChanged, page, pageSize, query, stateFilter, liveT]);
+  }, [onChanged, page, pageSize, query, stateFilter]);
 
   React.useEffect(() => {
     void load();
-    const timer = setInterval(() => void load(), 2_000);
-    return () => clearInterval(timer);
+    const stopPolling = setVisibleInterval(() => void load(), 2_000);
+    return stopPolling;
   }, [load]);
 
   const selectable = React.useMemo(
@@ -2164,11 +1808,11 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
         const archiveID = Number(item.archive_id ?? item.id);
         if (item.ok && Number.isSafeInteger(archiveID) && archiveID > 0) pendingRestoreIDs.current.add(archiveID);
       }
-      if (succeeded > 0) toast.success(translate("taskUI.tasksRestoreQueued", { count: succeeded }));
-      if (failed > 0) toast.error(translate("taskUI.restoreFailures", { count: failed }));
+      if (succeeded > 0) toast.success(t("Queued {count} tasks for restore", { count: succeeded }));
+      if (failed > 0) toast.error(t("{count} tasks could not be restored", { count: failed }));
       afterAction();
     } catch (error) {
-      toast.error(translate("taskUI.restoreError", { message: taskError(error, translate) }));
+      toast.error(t("Restore failed: {error}", { error: (error as Error).message }));
     }
   }
 
@@ -2189,11 +1833,11 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
           : await api.deleteTaskArchives(items.map((archive) => archive.id));
       const succeeded = result.items.filter((item) => item.ok).length;
       const failed = result.items.length - succeeded;
-      if (succeeded > 0) toast.success(translate("taskUI.archivesDeleteQueued", { count: succeeded }));
-      if (failed > 0) toast.error(translate("taskUI.archiveDeleteFailures", { count: failed }));
+      if (succeeded > 0) toast.success(t("Queued {count} archives for permanent deletion", { count: succeeded }));
+      if (failed > 0) toast.error(t("{count} archives could not be deleted", { count: failed }));
       afterAction();
     } catch (error) {
-      toast.error(translate("taskUI.permanentDeleteFailed", { message: taskError(error, translate) }));
+      toast.error(t("Permanent delete failed: {error}", { error: (error as Error).message }));
       throw error;
     }
   }
@@ -2203,10 +1847,10 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
       if (archive.state === "archive_failed") await api.archiveTask(String(archive.task_id));
       if (archive.state === "restore_failed") await api.restoreTaskArchive(archive.id);
       if (archive.state === "delete_failed") await api.deleteTaskArchive(archive.id);
-      toast.success(translate("taskUI.requeued"));
+      toast.success(t("Re-queued for processing"));
       afterAction();
     } catch (error) {
-      toast.error(translate("taskUI.retryFailed", { message: taskError(error, translate) }));
+      toast.error(t("Retry failed: {error}", { error: (error as Error).message }));
     }
   }
 
@@ -2222,7 +1866,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                 setQuery(event.target.value);
                 setPage(1);
               }}
-              placeholder={translate("taskUI.archiveSearch")}
+              placeholder={t("Search task name / description / ID")}
               className="pl-8"
             />
           </div>
@@ -2234,37 +1878,32 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
             }}
           >
             <SelectTrigger className="w-36">
-              <SelectValue placeholder={translate("taskUI.processingState")} />
+              <SelectValue placeholder={t("State")} />
             </SelectTrigger>
             <SelectContent>
               <SelectGroup>
-                <SelectItem value="all">{translate("taskUI.allStates")}</SelectItem>
-                <SelectItem value="archive_queued">{translate("taskUI.archiveQueued")}</SelectItem>
-                <SelectItem value="archiving">{translate("taskUI.archiving")}</SelectItem>
-                <SelectItem value="ready">{translate("taskUI.ready")}</SelectItem>
-                <SelectItem value="restore_queued">{translate("taskUI.restoreQueued")}</SelectItem>
-                <SelectItem value="restoring">{translate("taskUI.restoring")}</SelectItem>
-                <SelectItem value="delete_queued">{translate("taskUI.deleteQueued")}</SelectItem>
-                <SelectItem value="deleting">{translate("taskUI.deleting")}</SelectItem>
-                <SelectItem value="archive_failed">{translate("taskUI.archiveFailed")}</SelectItem>
-                <SelectItem value="restore_failed">{translate("taskUI.restoreFailed")}</SelectItem>
-                <SelectItem value="delete_failed">{translate("taskUI.deleteFailed")}</SelectItem>
+                <SelectItem value="all">{t("All statuses")}</SelectItem>
+                <SelectItem value="archive_queued">{t("Archive queued")}</SelectItem>
+                <SelectItem value="archiving">{t("Archiving")}</SelectItem>
+                <SelectItem value="ready">{t("Restorable")}</SelectItem>
+                <SelectItem value="restore_queued">{t("Restore queued")}</SelectItem>
+                <SelectItem value="restoring">{t("Restoring")}</SelectItem>
+                <SelectItem value="delete_queued">{t("Delete queued")}</SelectItem>
+                <SelectItem value="deleting">{t("Deleting")}</SelectItem>
+                <SelectItem value="archive_failed">{t("Archive failed")}</SelectItem>
+                <SelectItem value="restore_failed">{t("Restore failed")}</SelectItem>
+                <SelectItem value="delete_failed">{t("Delete failed")}</SelectItem>
               </SelectGroup>
             </SelectContent>
           </Select>
-          <span className="text-muted-foreground text-xs tabular-nums">
-            {translate("taskUI.archiveCount", { count: total })}
-          </span>
+          <span className="text-muted-foreground text-xs tabular-nums">{t("{count} archives", { count: total })}</span>
           {selectedArchives.length > 0 && (
             <>
-              <span className="text-xs tabular-nums">
-                {translate("taskUI.selectedCount", { count: selectedArchives.length })}
-              </span>
+              <span className="text-xs tabular-nums">{t("{count} selected", { count: selectedArchives.length })}</span>
               {restorable.length > 0 && (
                 <Button size="sm" variant="outline" onClick={() => void restoreMany(restorable)}>
                   <Undo2Icon data-icon="inline-start" />
-                  {translate("taskUI.restore")}
-                  {restorable.length}
+                  {t("Restore {count}", { count: restorable.length })}
                 </Button>
               )}
               {deletable.length > 0 && (
@@ -2274,8 +1913,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                   trigger={
                     <Button size="sm" variant="destructive">
                       <Trash2Icon data-icon="inline-start" />
-                      {translate("taskUI.permanentDelete")}
-                      {deletable.length}
+                      {t("Permanently delete {count}", { count: deletable.length })}
                     </Button>
                   }
                 />
@@ -2290,8 +1928,8 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
         ) : archives.length === 0 ? (
           <Empty className="mx-4 border border-dashed lg:mx-6">
             <EmptyHeader>
-              <EmptyTitle>{translate("taskUI.noArchives")}</EmptyTitle>
-              <EmptyDescription>{translate("taskUI.noArchivesHelp")}</EmptyDescription>
+              <EmptyTitle>{t("No task archives")}</EmptyTitle>
+              <EmptyDescription>{t("Paused or terminal tasks can be archived from the current task list.")}</EmptyDescription>
             </EmptyHeader>
           </Empty>
         ) : (
@@ -2304,17 +1942,17 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                     onCheckedChange={(checked) =>
                       setSelected(checked === true ? new Set(selectable.map((archive) => archive.id)) : new Set())
                     }
-                    aria-label={translate("taskUI.selectArchivePage")}
+                    aria-label={t("Select the archives on this page")}
                   />
                 </TableHead>
-                <TableHead>{translate("taskUI.task")}</TableHead>
-                <TableHead>{translate("taskUI.originalState")}</TableHead>
-                <TableHead>{translate("taskUI.categoryLabel")}</TableHead>
-                <TableHead>{translate("taskUI.archivedAt")}</TableHead>
-                <TableHead>{translate("taskUI.compressedSize")}</TableHead>
-                <TableHead>{translate("taskUI.dataCount")}</TableHead>
-                <TableHead className="min-w-44">{translate("taskUI.processingState")}</TableHead>
-                <TableHead className="text-right">{translate("taskUI.actions")}</TableHead>
+                <TableHead>{t("Task")}</TableHead>
+                <TableHead>{t("Original status")}</TableHead>
+                <TableHead>{t("Category")}</TableHead>
+                <TableHead>{t("Archived at")}</TableHead>
+                <TableHead>{t("Compressed size")}</TableHead>
+                <TableHead>{t("Data records")}</TableHead>
+                <TableHead className="min-w-44">{t("State")}</TableHead>
+                <TableHead className="text-right">{t("Actions")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -2336,15 +1974,13 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                             return next;
                           })
                         }
-                        aria-label={translate("taskUI.selectArchive", { id: archive.task_id })}
+                        aria-label={t("Select task archive #{id}", { id: archive.task_id })}
                       />
                     </TableCell>
                     <TableCell className="max-w-sm">
                       <div className="flex min-w-0 flex-col gap-0.5">
                         <span className="truncate font-medium">
-                          {archive.task_name ||
-                            archive.task_description ||
-                            translate("taskUI.taskId", { id: archive.task_id })}
+                          {archive.task_name || archive.task_description || t("Task #{id}", { id: archive.task_id })}
                         </span>
                         <span className="text-muted-foreground truncate text-xs">
                           #{archive.task_id} · {archive.task_description}
@@ -2354,96 +1990,71 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                     <TableCell>
                       <StatusBadge domain="task" value={archive.original_status} dot />
                     </TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {archive.category_name || translate("taskUI.uncategorized")}
-                    </TableCell>
+                    <TableCell className="text-muted-foreground">{archive.category_name || t("Uncategorized")}</TableCell>
                     <TableCell className="text-muted-foreground whitespace-nowrap text-xs">
-                      {archiveDate(archive.archived_at || archive.requested_at, i18n.resolvedLanguage ?? "zh-CN")}
+                      {archiveDate(archive.archived_at || archive.requested_at)}
                     </TableCell>
                     <TableCell
                       className="whitespace-nowrap text-xs"
-                      title={translate("taskUI.beforeCompression", { size: formatArchiveBytes(archive.original_size) })}
+                      title={t("Before compression: {size}", { size: formatArchiveBytes(archive.original_size) })}
                     >
-                      {archiveCompressionLabel(archive, translate)}
+                      {archiveCompressionLabel(archive)}
                     </TableCell>
-                    <TableCell className="text-xs tabular-nums">{archiveDataTotal(archive).toLocaleString()}</TableCell>
+                    <TableCell className="text-xs tabular-nums">{archiveDataTotal(archive).toLocaleString(intlLocale)}</TableCell>
                     <TableCell>
                       <div className="flex min-w-0 flex-col gap-1.5">
                         <ArchiveStateBadge state={archive.state} />
                         {processing && <Progress value={archive.progress} />}
                         {archive.error && (
-                          <p className="text-destructive text-xs [overflow-wrap:anywhere]">
-                            {taskError(archive.error, translate)}
-                          </p>
+                          <p className="text-destructive text-xs [overflow-wrap:anywhere]">{archive.error}</p>
                         )}
                         {[...new Set(archive.warnings ?? [])].map((warning) => (
                           <p
-                            key={taskError(warning, translate)}
+                            key={warning}
                             className="text-amber-700 text-xs [overflow-wrap:anywhere] dark:text-amber-400"
                           >
                             {warning}
                           </p>
                         ))}
                         <span className="text-muted-foreground text-xs">
-                          {translate(`taskUI.phase.${archive.phase}`, { defaultValue: archive.phase })} ·{" "}
-                          {archive.progress}%
+                          {t(archive.phase)} · {archive.progress}%
                         </span>
                       </div>
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-0.5">
                         {ARCHIVE_FAILED_STATES.has(archive.state) && (
-                          <TaskActionTooltip
-                            label={translate("taskUI.retryArchive")}
-                            description={translate("taskUI.retryArchiveHelp")}
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            onClick={() => void retry(archive)}
+                            aria-label={t("Retry archive operation")}
+                            title={t("Retry")}
                           >
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              onClick={() => void retry(archive)}
-                              aria-label={translate("taskUI.retryArchive")}
-                            >
-                              <Undo2Icon />
-                            </Button>
-                          </TaskActionTooltip>
+                            <Undo2Icon />
+                          </Button>
                         )}
                         {canRestore && (
-                          <TaskActionTooltip
-                            label={translate("taskUI.restoreTask")}
-                            description={translate("taskUI.restoreHelp")}
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            onClick={() => void restoreMany([archive])}
+                            aria-label={t("Restore task")}
+                            title={t("Restore task")}
                           >
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              onClick={() => void restoreMany([archive])}
-                              aria-label={translate("taskUI.restoreTask")}
-                            >
-                              <Undo2Icon />
-                            </Button>
-                          </TaskActionTooltip>
+                            <Undo2Icon />
+                          </Button>
                         )}
                         {canDelete && (
-                          <Tooltip delayDuration={200}>
-                            <ArchiveDeleteDialog
-                              archives={[archive]}
-                              onConfirm={() => deleteMany([archive])}
-                              trigger={
-                                <TooltipTrigger asChild>
-                                  <Button size="icon" variant="ghost" aria-label={translate("taskUI.deleteArchive")}>
-                                    <Trash2Icon />
-                                  </Button>
-                                </TooltipTrigger>
-                              }
-                            />
-                            <TooltipContent
-                              side="top"
-                              sideOffset={6}
-                              className="block max-w-64 space-y-1 text-left leading-relaxed"
-                            >
-                              <p className="font-medium">{translate("taskUI.deleteArchive")}</p>
-                              <p>{translate("taskUI.deleteArchiveHelp")}</p>
-                            </TooltipContent>
-                          </Tooltip>
+                          <ArchiveDeleteDialog
+                            archives={[archive]}
+                            onConfirm={() => deleteMany([archive])}
+                            trigger={
+                              <Button size="icon" variant="ghost" aria-label={t("Permanently delete archive")} title={t("Permanently delete")}>
+                                <Trash2Icon />
+                              </Button>
+                            }
+                          />
                         )}
                       </div>
                     </TableCell>
@@ -2484,7 +2095,7 @@ const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
   "delete_llm_records",
 ];
 
-// DeleteOptionFields renders the「同时清理关联数据」checkbox block shared by the
+// DeleteOptionFields renders the "also clean up related data" checkbox block shared by the
 // single-task and bulk delete dialogs. idPrefix keeps the label/input ids unique when
 // several dialogs live in the same table.
 function DeleteOptionFields({
@@ -2498,7 +2109,6 @@ function DeleteOptionFields({
   onOptionsChange: React.Dispatch<React.SetStateAction<DeleteTaskOptions>>;
   disabled: boolean;
 }) {
-  const { t: translate } = useLiveTranslation();
   const selectedCount = deleteOptionKeys.filter((key) => options[key]).length;
   let allChecked: boolean | "indeterminate" = false;
   if (selectedCount === deleteOptionKeys.length) {
@@ -2523,7 +2133,7 @@ function DeleteOptionFields({
 
   return (
     <FieldSet disabled={disabled}>
-      <FieldLegend variant="label">{translate("taskUI.cleanup")}</FieldLegend>
+      <FieldLegend variant="label">{t("Also clean up related data")}</FieldLegend>
       <FieldGroup className="gap-3">
         <Field orientation="horizontal">
           <Checkbox
@@ -2532,8 +2142,8 @@ function DeleteOptionFields({
             onCheckedChange={(checked) => updateAllOptions(checked === true)}
           />
           <FieldContent>
-            <FieldLabel htmlFor={`delete-all-${idPrefix}`}>{translate("taskUI.deleteAll")}</FieldLabel>
-            <FieldDescription>{translate("taskUI.deleteAllHelp")}</FieldDescription>
+            <FieldLabel htmlFor={`delete-all-${idPrefix}`}>{t("Delete all")}</FieldLabel>
+            <FieldDescription>{t("Check every related data type below, including assets, traffic, files, findings, and LLM request/response records.")}</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2543,8 +2153,8 @@ function DeleteOptionFields({
             onCheckedChange={(checked) => updateOption("delete_assets", checked === true)}
           />
           <FieldContent>
-            <FieldLabel htmlFor={`delete-assets-${idPrefix}`}>{translate("taskUI.linkedAssets")}</FieldLabel>
-            <FieldDescription>{translate("taskUI.deleteAssetsHelp")}</FieldDescription>
+            <FieldLabel htmlFor={`delete-assets-${idPrefix}`}>{t("Related assets")}</FieldLabel>
+            <FieldDescription>{t("Delete assets that belong only to this task; shared assets are only detached from the current task.")}</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2554,8 +2164,8 @@ function DeleteOptionFields({
             onCheckedChange={(checked) => updateOption("delete_traffic", checked === true)}
           />
           <FieldContent>
-            <FieldLabel htmlFor={`delete-traffic-${idPrefix}`}>{translate("taskUI.linkedTraffic")}</FieldLabel>
-            <FieldDescription>{translate("taskUI.deleteTrafficHelp")}</FieldDescription>
+            <FieldLabel htmlFor={`delete-traffic-${idPrefix}`}>{t("Related traffic")}</FieldLabel>
+            <FieldDescription>{t("Deleted by the related assets' exact hostnames; traffic of shared hosts still referenced by other tasks is kept.")}</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2565,8 +2175,8 @@ function DeleteOptionFields({
             onCheckedChange={(checked) => updateOption("delete_files", checked === true)}
           />
           <FieldContent>
-            <FieldLabel htmlFor={`delete-files-${idPrefix}`}>{translate("taskUI.taskFiles")}</FieldLabel>
-            <FieldDescription>{translate("taskUI.deleteFilesHelp")}</FieldDescription>
+            <FieldLabel htmlFor={`delete-files-${idPrefix}`}>{t("Task files")}</FieldLabel>
+            <FieldDescription>{t("Delete uploaded files, command output, and other artifacts in the task's working directory.")}</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2576,8 +2186,8 @@ function DeleteOptionFields({
             onCheckedChange={(checked) => updateOption("delete_findings", checked === true)}
           />
           <FieldContent>
-            <FieldLabel htmlFor={`delete-findings-${idPrefix}`}>{translate("taskUI.linkedFindings")}</FieldLabel>
-            <FieldDescription>{translate("taskUI.deleteFindingsHelp")}</FieldDescription>
+            <FieldLabel htmlFor={`delete-findings-${idPrefix}`}>{t("Related findings")}</FieldLabel>
+            <FieldDescription>{t("Permanently delete the standalone finding records and finding reports produced by this task.")}</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2587,8 +2197,8 @@ function DeleteOptionFields({
             onCheckedChange={(checked) => updateOption("delete_llm_records", checked === true)}
           />
           <FieldContent>
-            <FieldLabel htmlFor={`delete-llm-records-${idPrefix}`}>{translate("taskUI.llmRecords")}</FieldLabel>
-            <FieldDescription>{translate("taskUI.deleteLLMHelp")}</FieldDescription>
+            <FieldLabel htmlFor={`delete-llm-records-${idPrefix}`}>{t("LLM request/response records")}</FieldLabel>
+            <FieldDescription>{t("Permanently delete the LLM requests, responses, tokens, and error details recorded for this task.")}</FieldDescription>
           </FieldContent>
         </Field>
       </FieldGroup>
@@ -2603,7 +2213,6 @@ function DeleteTaskDialog({
   task: Task;
   onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
@@ -2626,29 +2235,25 @@ function DeleteTaskDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={handleOpenChange}>
-      <TaskActionTooltip label={translate("taskUI.deleteTask")} description={translate("taskUI.deleteTaskHelp")}>
-        <AlertDialogTrigger asChild>
-          <Button size="icon" variant="outline" aria-label={translate("taskUI.deleteTask")}>
-            <Trash2Icon className="text-destructive" />
-          </Button>
-        </AlertDialogTrigger>
-      </TaskActionTooltip>
+      <AlertDialogTrigger asChild>
+        <Button size="icon" variant="outline" aria-label={t("Delete task")}>
+          <Trash2Icon className="text-destructive" />
+        </Button>
+      </AlertDialogTrigger>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{translate("taskUI.confirmDeleteTask", { id: task.id })}</AlertDialogTitle>
-          <AlertDialogDescription className="break-words">
-            {translate("taskUI.deleteTaskDetails", {
-              name: task.description
-                ? task.description.length > 80
-                  ? `${task.description.slice(0, 80)}…`
-                  : task.description
-                : translate("taskUI.thisTask"),
-            })}
+          <AlertDialogTitle>{t("Delete task #{id}?", { id: task.id })}</AlertDialogTitle>
+          <AlertDialogDescription className="[overflow-wrap:anywhere]">
+            {task.description
+              ? t("“{description}” will be permanently deleted together with its execution records and exploration graph.", {
+                  description: task.description.length > 80 ? `${task.description.slice(0, 80)}…` : task.description,
+                })
+              : t("This task will be permanently deleted together with its execution records and exploration graph.")}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <DeleteOptionFields idPrefix={task.id} options={options} onOptionsChange={setOptions} disabled={deleting} />
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={deleting}>{translate("taskUI.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel disabled={deleting}>{t("Cancel")}</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
             disabled={deleting}
@@ -2658,7 +2263,7 @@ function DeleteTaskDialog({
             }}
           >
             {deleting && <Spinner data-icon="inline-start" />}
-            {deleting ? translate("taskUI.deleting") : translate("taskUI.delete")}
+            {deleting ? t("Deleting") : t("Delete")}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -2683,7 +2288,6 @@ function MoveTasksCategoryDialog({
   moving: boolean;
   onMove: (categoryID?: number) => Promise<void>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [target, setTarget] = React.useState(UNCATEGORIZED_VALUE);
 
@@ -2697,23 +2301,27 @@ function MoveTasksCategoryDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button size="sm" variant="outline">
-          <FolderInputIcon data-icon="inline-start" /> {translate("taskUI.changeCategory")}
+          <FolderInputIcon data-icon="inline-start" /> {t("Change category")}
         </Button>
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{translate("taskUI.moveCategoryTitle", { count })}</DialogTitle>
-          <DialogDescription>{translate("taskUI.changeCategoryHelp")}</DialogDescription>
+          <DialogTitle>{t("Change the category of {count} selected tasks", { count })}</DialogTitle>
+          <DialogDescription>
+            {t(
+              "The target category applies to all selected tasks; choosing \"Uncategorized\" moves them out of their current category.",
+            )}
+          </DialogDescription>
         </DialogHeader>
         <Field>
-          <FieldLabel htmlFor="bulk-category">{translate("taskUI.targetCategory")}</FieldLabel>
+          <FieldLabel htmlFor="bulk-category">{t("Target category")}</FieldLabel>
           <Select value={target} onValueChange={setTarget} disabled={moving}>
             <SelectTrigger id="bulk-category" className="w-full">
-              <SelectValue placeholder={translate("taskUI.selectCategory")} />
+              <SelectValue placeholder={t("Select a category")} />
             </SelectTrigger>
             <SelectContent>
               <SelectGroup>
-                <SelectItem value={UNCATEGORIZED_VALUE}>{translate("taskUI.uncategorized")}</SelectItem>
+                <SelectItem value={UNCATEGORIZED_VALUE}>{t("Uncategorized")}</SelectItem>
                 {categories.map((category) => (
                   <SelectItem key={category.id} value={String(category.id)}>
                     {category.name}
@@ -2722,12 +2330,12 @@ function MoveTasksCategoryDialog({
               </SelectGroup>
             </SelectContent>
           </Select>
-          {categories.length === 0 && <FieldDescription>{translate("taskUI.noCategoriesHelp")}</FieldDescription>}
+          {categories.length === 0 && <FieldDescription>{t("No categories yet; create one in \"Category management\" first.")}</FieldDescription>}
         </Field>
         <DialogFooter>
           <DialogClose asChild>
             <Button variant="outline" disabled={moving}>
-              {translate("taskUI.cancel")}
+              {t("Cancel")}
             </Button>
           </DialogClose>
           <Button
@@ -2737,7 +2345,7 @@ function MoveTasksCategoryDialog({
             }}
           >
             {moving && <Spinner data-icon="inline-start" />}
-            {translate("taskUI.move")}
+            {t("Move")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -2752,7 +2360,6 @@ function BulkDeleteTasksDialog({
   ids: string[];
   onDelete: (ids: string[], options: DeleteTaskOptions, onProgress: (done: number) => void) => Promise<void>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [done, setDone] = React.useState(0);
@@ -2782,13 +2389,17 @@ function BulkDeleteTasksDialog({
     <AlertDialog open={open} onOpenChange={handleOpenChange}>
       <AlertDialogTrigger asChild>
         <Button size="sm" variant="outline">
-          <Trash2Icon className="text-destructive" /> {translate("taskUI.deleteSelectedCount", { count: ids.length })}
+          <Trash2Icon className="text-destructive" /> {t("Delete selected {count}", { count: ids.length })}
         </Button>
       </AlertDialogTrigger>
       <AlertDialogContent className="max-h-[85vh] overflow-y-auto">
         <AlertDialogHeader>
-          <AlertDialogTitle>{translate("taskUI.confirmDeleteSelected", { count: ids.length })}</AlertDialogTitle>
-          <AlertDialogDescription>{translate("taskUI.deleteSelectedHelp")}</AlertDialogDescription>
+          <AlertDialogTitle>{t("Delete {count} selected tasks?", { count: ids.length })}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {t(
+              "The execution records and exploration graphs of these tasks will be permanently deleted; the cleanup options below apply to all selected tasks.",
+            )}
+          </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="text-muted-foreground flex flex-wrap gap-1 text-xs">
           {ids.slice(0, 30).map((id) => (
@@ -2796,13 +2407,11 @@ function BulkDeleteTasksDialog({
               #{id}
             </code>
           ))}
-          {ids.length > 30 && (
-            <span className="self-center">{translate("taskUI.moreSelected", { count: ids.length })}</span>
-          )}
+          {ids.length > 30 && <span className="self-center">{t("…{count} in total", { count: ids.length })}</span>}
         </div>
         <DeleteOptionFields idPrefix="bulk" options={options} onOptionsChange={setOptions} disabled={deleting} />
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={deleting}>{translate("taskUI.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel disabled={deleting}>{t("Cancel")}</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
             disabled={deleting}
@@ -2813,8 +2422,8 @@ function BulkDeleteTasksDialog({
           >
             {deleting && <Spinner data-icon="inline-start" />}
             {deleting
-              ? translate("taskUI.deleteProgress", { done: done, total: ids.length })
-              : translate("taskUI.deleteTasks", { count: ids.length })}
+              ? t("Deleting {done}/{total}", { done, total: ids.length })
+              : t("Delete {count} tasks", { count: ids.length })}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -2822,8 +2431,8 @@ function BulkDeleteTasksDialog({
   );
 }
 
-// CreateTaskSheet is the 新建任务 drawer. Its form state lives HERE, not in TasksPage: with
-// 描述/目标 held by the page component every keystroke re-rendered the whole task table
+// CreateTaskSheet is the create-task drawer. Its form state lives HERE, not in TasksPage: with
+// description/goal held by the page component every keystroke re-rendered the whole task table
 // behind the drawer (plus its sticky column and 20 AlertDialog trees), which showed up as
 // input lag. Now typing only re-renders the drawer.
 function SourceTaskPicker({
@@ -2837,7 +2446,6 @@ function SourceTaskPicker({
   onValueChange: (value: string[]) => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const tasksByID = React.useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
   const taskIDs = React.useMemo(() => tasks.map((task) => task.id), [tasks]);
   const atLimit = value.length >= MAX_SOURCE_TASKS;
@@ -2865,14 +2473,12 @@ function SourceTaskPicker({
         </ComboboxValue>
         <ComboboxChipsInput
           id="source-tasks"
-          placeholder={
-            atLimit ? translate("taskUI.sourceLimit", { count: MAX_SOURCE_TASKS }) : translate("taskUI.sourceSearch")
-          }
+          placeholder={atLimit ? t("Link up to {count} tasks", { count: MAX_SOURCE_TASKS }) : t("Search task ID, description, or goal")}
           disabled={atLimit}
         />
       </ComboboxChips>
       <ComboboxContent portalContainer={portalContainer}>
-        <ComboboxEmpty>{translate("taskUI.sourceNoMatches")}</ComboboxEmpty>
+        <ComboboxEmpty>{t("No matching tasks")}</ComboboxEmpty>
         <ComboboxList>
           {(taskID) => {
             const task = tasksByID.get(taskID);
@@ -2881,11 +2487,11 @@ function SourceTaskPicker({
                 <div className="flex min-w-0 flex-1 items-center gap-2">
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">
-                      #{taskID} · {task?.description ?? translate("taskUI.unknownTask")}
+                      #{taskID} · {task?.description ?? t("Unknown task")}
                     </p>
                     {task?.goal && <p className="text-muted-foreground truncate text-xs">{task.goal}</p>}
                   </div>
-                  {task && <StatusBadge domain="task" value={task.status} stopReason={task.stop_reason} />}
+                  {task && <StatusBadge domain="task" value={task.status} />}
                 </div>
               </ComboboxItem>
             );
@@ -2896,9 +2502,9 @@ function SourceTaskPicker({
   );
 }
 
-// CategoryPicker 是新建任务里的单选分类选择器：可搜索已有分类；输入库里没有的名称后
-// 回车（或点下拉里的「创建」）即时新建分类并选中，选中项以可移除的 tag 展示。分类是
-// 全局资源，这里即时创建与「分类管理」里手动新建等价。只允许一个分类。
+// CategoryPicker is the single-category picker in the create-task form: search existing categories; typing a name not in the
+// library and pressing Enter (or clicking "Create" in the dropdown) creates the category on the fly and selects it; the selection shows as a removable tag. Categories are
+// global resources, so creating one here is equivalent to creating it manually in "Category management". Only one category is allowed.
 function CategoryPicker({
   categories,
   value,
@@ -2912,11 +2518,10 @@ function CategoryPicker({
   onCategoryCreated: () => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [inputValue, setInputValue] = React.useState("");
   const [creating, setCreating] = React.useState(false);
-  // 新建的分类要等父层重新拉取才回流到 categories，先本地留一份，避免选中的 chip 和
-  // 下拉在这段窗口里显示成「未知分类」。
+  // A newly created category only flows back into categories after the parent re-fetches, so keep a local copy to avoid the selected chip and
+  // the dropdown showing "Unknown category" during that window.
   const [localExtra, setLocalExtra] = React.useState<TaskCategory[]>([]);
 
   const allCategories = React.useMemo(() => {
@@ -2932,14 +2537,14 @@ function CategoryPicker({
 
   const trimmed = inputValue.trim();
   const lower = trimmed.toLowerCase();
-  // 与 base-ui 默认子串过滤保持一致，用来判断「有没有相关分类」。
+  // Matches base-ui's default substring filter, used to decide whether "any related categories exist".
   const matchCount = trimmed
     ? allCategories.filter((c) => c.name.toLowerCase().includes(lower)).length
     : allCategories.length;
 
   const createAndSelect = async () => {
     if (!trimmed || creating) return;
-    // 精确同名已存在则直接选中，不重复创建。
+    // An exact same-name category already exists: select it directly instead of creating a duplicate.
     const existing = allCategories.find((c) => c.name.toLowerCase() === lower);
     if (existing) {
       onValueChange(existing.id);
@@ -2953,9 +2558,9 @@ function CategoryPicker({
       onValueChange(created.id);
       setInputValue("");
       onCategoryCreated();
-      toast.success(translate("taskUI.categoryCreatedName", { name: created.name }));
+      toast.success(t("Category \"{name}\" created", { name: created.name }));
     } catch (e) {
-      toast.error(translate("taskUI.createCategoryFailed", { message: taskError(e, translate) }));
+      toast.error(t("Failed to create category: {error}", { error: (e as Error).message }));
     } finally {
       setCreating(false);
     }
@@ -2968,7 +2573,7 @@ function CategoryPicker({
       multiple
       value={selectedIDs}
       onValueChange={(next: string[]) => {
-        // 单选：取最新选中的一个；移除 chip（清空）则回到未分类。
+        // Single select: keep the most recently selected one; removing the chip (clearing) returns to uncategorized.
         const last = next[next.length - 1];
         onValueChange(last ? Number(last) : undefined);
         setInputValue("");
@@ -2979,14 +2584,14 @@ function CategoryPicker({
       <ComboboxChips>
         <ComboboxValue>
           {selectedIDs.map((id) => (
-            <ComboboxChip key={id}>{byID.get(id)?.name ?? translate("taskUI.unknownCategory")}</ComboboxChip>
+            <ComboboxChip key={id}>{byID.get(id)?.name ?? t("Unknown category")}</ComboboxChip>
           ))}
         </ComboboxValue>
         <ComboboxChipsInput
           id="task-category"
-          placeholder={selectedIDs.length ? "" : translate("taskUI.categorySearch")}
+          placeholder={selectedIDs.length ? "" : t("Search categories, or type a new name and press Enter to create")}
           onKeyDown={(e) => {
-            // 完全无匹配时回车 = 创建；有匹配项时保留 base-ui 的「回车选中高亮项」。
+            // Enter with zero matches = create; with matches, keep base-ui's "Enter selects the highlighted item".
             if (e.key === "Enter" && matchCount === 0 && trimmed) {
               e.preventDefault();
               void createAndSelect();
@@ -3011,10 +2616,10 @@ function CategoryPicker({
               className="flex w-full items-center gap-2 px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
             >
               {creating ? <Spinner className="size-4" /> : <PlusIcon className="size-4" />}
-              {translate("taskUI.createCategoryName", { name: trimmed })}
+              {t("Create category \"{name}\"", { name: trimmed })}
             </button>
           ) : (
-            <div className="px-2 py-2 text-sm text-muted-foreground">{translate("taskUI.categorySearchHelp")}</div>
+            <div className="px-2 py-2 text-sm text-muted-foreground">{t("Type a name to search or create a category")}</div>
           ))}
       </ComboboxContent>
     </Combobox>
@@ -3022,21 +2627,22 @@ function CategoryPicker({
 }
 
 const COMPANY_SCOPE_LABELS: Record<string, string> = {
-  domain: "taskUI.domain",
+  domain: t("Domain"),
   ip: "IP",
   cidr: "CIDR",
   icp: "ICP",
-  keyword: "taskUI.keyword",
+  keyword: t("Keyword"),
 };
 
-function companyScopeSummary(company: Company, translate: TFunction): string {
+function companyScopeSummary(company: Company): string {
   const rows = company.scope ?? [];
-  if (rows.length === 0) return translate("taskUI.noScope");
+  if (rows.length === 0) return t("No asset scope configured");
   const preview = rows.slice(0, 3).map((row) => {
     const value = row.raw || row.value || row.domain || row.net || "";
-    return `${translate(COMPANY_SCOPE_LABELS[row.kind] ?? row.kind)}: ${value}`;
+    return `${COMPANY_SCOPE_LABELS[row.kind] ?? row.kind}: ${value}`;
   });
-  return `${preview.join(" · ")}${rows.length > preview.length ? translate("taskUI.scopeMore", { count: rows.length - preview.length }) : ""}`;
+  const more = rows.length > preview.length ? ` · ${t("{count} more", { count: rows.length - preview.length })}` : "";
+  return `${preview.join(" · ")}${more}`;
 }
 
 function CompanyPicker({
@@ -3050,7 +2656,6 @@ function CompanyPicker({
   onValueChange: (value: number[]) => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const companiesByID = React.useMemo(
     () => new Map(companies.map((company) => [String(company.id), company])),
     [companies],
@@ -3063,7 +2668,7 @@ function CompanyPicker({
       items={companyIDs}
       itemToStringValue={(companyID) => {
         const company = companiesByID.get(companyID);
-        return company ? `${company.name} ${companyScopeSummary(company, translate)}` : companyID;
+        return company ? `${company.name} ${companyScopeSummary(company)}` : companyID;
       }}
       multiple
       value={selectedIDs}
@@ -3072,15 +2677,13 @@ function CompanyPicker({
       <ComboboxChips>
         <ComboboxValue>
           {selectedIDs.map((companyID) => (
-            <ComboboxChip key={companyID}>
-              {companiesByID.get(companyID)?.name ?? translate("taskUI.companyId", { id: companyID })}
-            </ComboboxChip>
+            <ComboboxChip key={companyID}>{companiesByID.get(companyID)?.name ?? t("Company #{id}", { id: companyID })}</ComboboxChip>
           ))}
         </ComboboxValue>
-        <ComboboxChipsInput id="task-companies" placeholder={translate("taskUI.companySearch")} />
+        <ComboboxChipsInput id="task-companies" placeholder={t("Search company name or asset scope")} />
       </ComboboxChips>
       <ComboboxContent portalContainer={portalContainer}>
-        <ComboboxEmpty>{translate("taskUI.companyNoMatches")}</ComboboxEmpty>
+        <ComboboxEmpty>{t("No matching companies")}</ComboboxEmpty>
         <ComboboxList>
           {(companyID) => {
             const company = companiesByID.get(companyID);
@@ -3088,19 +2691,14 @@ function CompanyPicker({
               <ComboboxItem key={companyID} value={companyID}>
                 <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                   <div className="flex min-w-0 items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate font-medium">
-                      {company?.name ?? translate("taskUI.companyId", { id: companyID })}
-                    </span>
+                    <span className="min-w-0 flex-1 truncate font-medium">{company?.name ?? t("Company #{id}", { id: companyID })}</span>
                     <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
-                      {translate("taskUI.assetCount", { count: company?.asset_count ?? 0 })}
+                      {t("{count} assets", { count: company?.asset_count ?? 0 })}
                     </span>
                   </div>
                   {company && (
-                    <span
-                      className="text-muted-foreground truncate text-xs"
-                      title={companyScopeSummary(company, translate)}
-                    >
-                      {companyScopeSummary(company, translate)}
+                    <span className="text-muted-foreground truncate text-xs" title={companyScopeSummary(company)}>
+                      {companyScopeSummary(company)}
                     </span>
                   )}
                 </div>
@@ -3130,11 +2728,7 @@ function CategoryDropTarget({
   disabled: boolean;
   onSelect: () => void;
 }) {
-  const { t: translate } = useLiveTranslation();
-  const { isOver, setNodeRef } = useDroppable({
-    id: `category:${value}`,
-    disabled,
-  });
+  const { isOver, setNodeRef } = useDroppable({ id: `category:${value}`, disabled });
 
   return (
     <button
@@ -3148,15 +2742,12 @@ function CategoryDropTarget({
       onClick={onSelect}
     >
       <span className="block truncate font-medium text-sm">{name}</span>
-      <span className="block truncate text-muted-foreground text-xs">
-        {isOver ? translate("taskUI.dropToMove") : translate("taskUI.taskCount", { count: count })}
-      </span>
+      <span className="block truncate text-muted-foreground text-xs">{isOver ? t("Release to move") : t("{count} tasks", { count })}</span>
     </button>
   );
 }
 
 function DraggableCategoryTask({ task, disabled, moving }: { task: Task; disabled: boolean; moving: boolean }) {
-  const { t: translate } = useLiveTranslation();
   const { attributes, isDragging, listeners, setNodeRef } = useDraggable({
     id: `task:${task.id}`,
     disabled,
@@ -3168,30 +2759,25 @@ function DraggableCategoryTask({ task, disabled, moving }: { task: Task; disable
         {moving ? (
           <Spinner />
         ) : (
-          <TaskActionTooltip
-            label={translate("taskUI.moveCategory")}
-            description={translate("taskUI.dragHelp")}
+          <Button
+            type="button"
+            size="icon-xs"
+            variant="ghost"
+            className="touch-none cursor-grab active:cursor-grabbing"
             disabled={disabled}
+            {...listeners}
+            {...attributes}
+            aria-label={t("Drag task #{id}", { id: task.id })}
+            title={t("Drag task")}
           >
-            <Button
-              type="button"
-              size="icon-xs"
-              variant="ghost"
-              className="touch-none cursor-grab active:cursor-grabbing"
-              disabled={disabled}
-              {...listeners}
-              {...attributes}
-              aria-label={translate("taskUI.dragTask", { id: task.id })}
-            >
-              <GripVerticalIcon />
-            </Button>
-          </TaskActionTooltip>
+            <GripVerticalIcon />
+          </Button>
         )}
       </ItemMedia>
       <ItemContent className="min-w-0">
         <ItemTitle className="w-full min-w-0">
           <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`} className="truncate hover:underline">
-            {task.name?.trim() || task.description || translate("taskUI.taskId", { id: task.id })}
+            {task.name?.trim() || task.description || t("Task #{id}", { id: task.id })}
           </Link>
         </ItemTitle>
         <ItemDescription className="line-clamp-1">
@@ -3199,14 +2785,13 @@ function DraggableCategoryTask({ task, disabled, moving }: { task: Task; disable
         </ItemDescription>
       </ItemContent>
       <ItemActions>
-        <StatusBadge domain="task" value={task.status} stopReason={task.stop_reason} />
+        <StatusBadge domain="task" value={task.status} />
       </ItemActions>
     </Item>
   );
 }
 
 function CategoryTaskDragPreview({ task }: { task: Task }) {
-  const { t: translate } = useLiveTranslation();
   return (
     <Item variant="outline" size="sm" className="w-80 bg-background shadow-lg">
       <ItemMedia className="group-has-data-[slot=item-description]/item:self-center group-has-data-[slot=item-description]/item:translate-y-0">
@@ -3214,7 +2799,7 @@ function CategoryTaskDragPreview({ task }: { task: Task }) {
       </ItemMedia>
       <ItemContent className="min-w-0">
         <ItemTitle className="w-full min-w-0 truncate">
-          {task.name?.trim() || task.description || translate("taskUI.taskId", { id: task.id })}
+          {task.name?.trim() || task.description || t("Task #{id}", { id: task.id })}
         </ItemTitle>
         <ItemDescription className="line-clamp-1">#{task.id}</ItemDescription>
       </ItemContent>
@@ -3233,7 +2818,6 @@ function CategoryManagementSheet({
   onChanged: () => void;
   onTaskMoved: (taskID: string, category: TaskCategory | null) => void;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [selectedView, setSelectedView] = React.useState<CategoryManagementView>("new");
   const [draftName, setDraftName] = React.useState("");
@@ -3305,19 +2889,18 @@ function CategoryManagementSheet({
         const created = await api.createTaskCategory(name);
         setSelectedView(created.id);
         setDraftName(created.name);
-        toast.success(translate("taskUI.categoryCreated"));
+        toast.success(t("Category created"));
       } else {
         const updated = await api.renameTaskCategory(selectedView, name);
         setDraftName(updated.name);
-        toast.success(translate("taskUI.categoryUpdated"));
+        toast.success(t("Category updated"));
       }
       onChanged();
     } catch (error) {
       toast.error(
-        translate("taskUI.categorySaveFailed", {
-          action: selectedView === "new" ? translate("taskUI.create") : translate("taskUI.updateAction"),
-          message: taskError(error, translate),
-        }),
+        selectedView === "new"
+          ? t("Failed to create category: {error}", { error: (error as Error).message })
+          : t("Failed to update category: {error}", { error: (error as Error).message }),
       );
     } finally {
       setSaving(false);
@@ -3333,11 +2916,11 @@ function CategoryManagementSheet({
       const next = categories.find((category) => category.id !== deletedID);
       if (next) selectCategory(next);
       else selectUncategorized();
-      toast.success(translate("taskUI.categoryDeleted"));
+      toast.success(t("Category deleted; its tasks moved to Uncategorized"));
       setDeleteOpen(false);
       onChanged();
     } catch (error) {
-      toast.error(translate("taskUI.deleteCategoryFailed", { message: taskError(error, translate) }));
+      toast.error(t("Failed to delete category: {error}", { error: (error as Error).message }));
     } finally {
       setDeleting(false);
     }
@@ -3348,7 +2931,7 @@ function CategoryManagementSheet({
     const category =
       destination === "uncategorized" ? null : (categories.find((item) => item.id === Number(destination)) ?? null);
     if (destination !== "uncategorized" && !category) {
-      toast.error(translate("taskUI.targetCategoryMissing"));
+      toast.error(t("Target category does not exist; refresh and try again"));
       return;
     }
     if (task.category_id === category?.id || (task.category_id == null && category == null)) return;
@@ -3357,11 +2940,9 @@ function CategoryManagementSheet({
     try {
       await api.updateTaskCategory(task.id, category?.id);
       onTaskMoved(task.id, category);
-      toast.success(
-        translate("taskUI.taskMoved", { id: task.id, category: category?.name ?? translate("taskUI.uncategorized") }),
-      );
+      toast.success(t("Task #{id} moved to \"{category}\"", { id: task.id, category: category?.name ?? t("Uncategorized") }));
     } catch (error) {
-      toast.error(translate("taskUI.moveTaskFailed", { message: taskError(error, translate) }));
+      toast.error(t("Failed to move task: {error}", { error: (error as Error).message }));
     } finally {
       setMovingTaskID(null);
     }
@@ -3384,11 +2965,7 @@ function CategoryManagementSheet({
     void moveTask(task, destination.slice("category:".length));
   }
 
-  const saveLabel = saving
-    ? translate("taskUI.saving")
-    : selectedView === "new"
-      ? translate("taskUI.createCategory")
-      : translate("taskUI.saveChanges");
+  const saveLabel = saving ? t("Saving") : selectedView === "new" ? t("Create category") : t("Save changes");
 
   return (
     <>
@@ -3396,13 +2973,17 @@ function CategoryManagementSheet({
         <SheetTrigger asChild>
           <Button size="sm" variant="outline">
             <TagsIcon data-icon="inline-start" />
-            {translate("taskUI.manageCategories")}
+            {t("Category management")}
           </Button>
         </SheetTrigger>
         <SheetContent className="grid h-full w-full! max-w-none! grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
           <SheetHeader className="border-b px-6 py-5">
-            <SheetTitle>{translate("taskUI.categoryManagement")}</SheetTitle>
-            <SheetDescription>{translate("taskUI.categoryManagementHelp")}</SheetDescription>
+            <SheetTitle>{t("Task category management")}</SheetTitle>
+            <SheetDescription>
+              {t(
+                "Categories are used for task filtering and archiving; edits never affect task execution, and deletion moves tasks to Uncategorized.",
+              )}
+            </SheetDescription>
           </SheetHeader>
           <DndContext
             sensors={sensors}
@@ -3414,13 +2995,13 @@ function CategoryManagementSheet({
               <div className="flex min-h-0 flex-col border-b p-3 lg:border-r lg:border-b-0">
                 <Button type="button" variant="outline" className="w-full" onClick={startNew}>
                   <PlusIcon data-icon="inline-start" />
-                  {translate("taskUI.newCategory")}
+                  {t("New category")}
                 </Button>
                 <ScrollArea className="mt-2 max-h-44 lg:max-h-none lg:flex-1">
                   <div className="flex flex-col gap-1 pr-2">
                     <CategoryDropTarget
                       value="uncategorized"
-                      name={translate("taskUI.uncategorized")}
+                      name={t("Uncategorized")}
                       count={uncategorizedCount}
                       selected={selectedView === "uncategorized"}
                       disabled={movingTaskID != null}
@@ -3444,12 +3025,12 @@ function CategoryManagementSheet({
                 <FieldGroup className="p-6">
                   {selectedView !== "uncategorized" && (
                     <Field>
-                      <FieldLabel htmlFor="task-category-name">{translate("taskUI.categoryName")}</FieldLabel>
+                      <FieldLabel htmlFor="task-category-name">{t("Category name")}</FieldLabel>
                       <Input
                         id="task-category-name"
                         value={draftName}
                         onChange={(event) => setDraftName(event.target.value)}
-                        placeholder={translate("taskUI.categoryExample")}
+                        placeholder={t("e.g. External assessment")}
                         maxLength={80}
                         onKeyDown={(event) => {
                           if (event.key === "Enter") void saveCategory();
@@ -3457,8 +3038,10 @@ function CategoryManagementSheet({
                       />
                       <FieldDescription>
                         {selectedCategory
-                          ? translate("taskUI.categoryUsed", { count: selectedCategory.task_count })
-                          : translate("taskUI.categoryCreateHelp")}
+                          ? t("{count} tasks currently use this category. Renaming updates the task list accordingly.", {
+                              count: selectedCategory.task_count,
+                            })
+                          : t("Once created, it is usable in the create-task form and task list filters.")}
                       </FieldDescription>
                     </Field>
                   )}
@@ -3466,27 +3049,19 @@ function CategoryManagementSheet({
                     <Field>
                       <div className="flex flex-wrap items-end justify-between gap-2">
                         <div className="flex min-w-0 flex-col gap-1">
-                          <FieldLabel>
-                            {selectedCategory
-                              ? translate("taskUI.categoryTasks")
-                              : translate("taskUI.uncategorizedTasks")}
-                          </FieldLabel>
+                          <FieldLabel>{selectedCategory ? t("Category tasks") : t("Uncategorized tasks")}</FieldLabel>
                           <FieldDescription>
                             {selectedCategory
-                              ? translate("taskUI.categoryContains", { count: visibleTasks.length })
-                              : translate("taskUI.uncategorizedCount", { count: visibleTasks.length })}
+                              ? t("This category contains {count} tasks.", { count: visibleTasks.length })
+                              : t("{count} tasks are not yet categorized.", { count: visibleTasks.length })}
                           </FieldDescription>
                         </div>
                       </div>
                       {visibleTasks.length === 0 ? (
                         <Empty className="min-h-36 border">
                           <EmptyHeader>
-                            <EmptyTitle>
-                              {selectedCategory
-                                ? translate("taskUI.categoryEmpty")
-                                : translate("taskUI.uncategorizedEmpty")}
-                            </EmptyTitle>
-                            <EmptyDescription>{translate("taskUI.categoryEmptyHelp")}</EmptyDescription>
+                            <EmptyTitle>{selectedCategory ? t("No tasks in this category") : t("No uncategorized tasks")}</EmptyTitle>
+                            <EmptyDescription>{t("Content appears here once tasks are assigned.")}</EmptyDescription>
                           </EmptyHeader>
                         </Empty>
                       ) : (
@@ -3518,11 +3093,11 @@ function CategoryManagementSheet({
                 onClick={() => setDeleteOpen(true)}
               >
                 <Trash2Icon data-icon="inline-start" />
-                {translate("taskUI.deleteCategory")}
+                {t("Delete category")}
               </Button>
             )}
             <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-              {translate("taskUI.close")}
+              {t("Close")}
             </Button>
             {selectedView !== "uncategorized" && (
               <Button
@@ -3541,16 +3116,17 @@ function CategoryManagementSheet({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {translate("taskUI.confirmDeleteCategory", {
-                name: selectedCategory?.name || translate("taskUI.untitledCategory"),
-              })}
+              {t("Delete category \"{name}\"?", { name: selectedCategory?.name || t("Unnamed category") })}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {translate("taskUI.deleteCategoryDetails", { count: selectedCategory?.task_count ?? 0 })}
+              {t(
+                "After the category is deleted, its {count} tasks move to \"Uncategorized\" automatically; task data is not deleted.",
+                { count: selectedCategory?.task_count ?? 0 },
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleting}>{translate("taskUI.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleting}>{t("Cancel")}</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={deleting}
@@ -3560,7 +3136,7 @@ function CategoryManagementSheet({
               }}
             >
               {deleting && <Spinner data-icon="inline-start" />}
-              {deleting ? translate("taskUI.deleting") : translate("taskUI.delete")}
+              {deleting ? t("Deleting") : t("Delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -3580,12 +3156,8 @@ function CreateTaskSheet({
   onCreated: () => void;
   onCategoriesChanged: () => void;
 }) {
-  const { t: translate } = useLiveTranslation();
-  const scheduleEnabledID = React.useId();
-  const scheduleImmediateID = React.useId();
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState("");
-  const [remark, setRemark] = React.useState("");
   const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
   const [description, setDescription] = React.useState("");
   const [goal, setGoal] = React.useState("");
@@ -3595,30 +3167,15 @@ function CreateTaskSheet({
   const [sourceTaskIDs, setSourceTaskIDs] = React.useState<string[]>([]);
   const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
   const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
+  const [llmRotate, setLLMRotate] = React.useState(false);
   const [creating, setCreating] = React.useState(false);
-  const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
-  const [noResultMin, setNoResultMin] = React.useState("");
-  const [noResultCount, setNoResultCount] = React.useState("1");
-  const [noResultSeverity, setNoResultSeverity] = React.useState<NonNullable<Task["no_result_min_severity"]>>("");
-  const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
-  const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
-  const [shareGlobalAssets, setShareGlobalAssets] = React.useState(false);
-  const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
-  const [workerCount, setWorkerCount] = React.useState(""); // 本任务 Worker 数;空/0=用全局默认
-  const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
-  const [scheduleEnabled, setScheduleEnabled] = React.useState(false);
-  const [schedule, setSchedule] = React.useState<ScheduleInput>({
-    name: "",
-    schedule_type: "weekly",
-    end_date: "",
-    weekdays: [6, 7],
-    start_time: "18:00",
-    end_time: "",
-    task_ids: [],
-    timezone_mode: "beijing",
-    start_immediately: false,
-  });
-  // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
+  const [timeoutMin, setTimeoutMin] = React.useState(""); // task-level timeout (minutes); empty/0 = no limit
+  const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner heartbeat (minutes); default 10, minimum 10 (matching the backend)
+  const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // dispatch a seed intent at creation so the worker starts without waiting for the first planner round; off by default, standard plan-then-execute
+  const [coverageEnabled, setCoverageEnabled] = React.useState(true); // asset coverage feature; on by default. Off = no coverage computed/displayed, no scope accumulation, scope-related tools hidden (company links unaffected)
+  const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // task-level asset intercept rules (this task only, never entering the global table)
+  const [credentials, setCredentials] = React.useState<TaskCredentialInput[]>([]); // test accounts declared at creation (#3); an empty password = the agent registers that account and records it
+  // Method 1, file upload: files are staged under drafts/<draftId>/uploads/ before the task is created, and their absolute paths are appended to the description.
   const [uploading, setUploading] = React.useState(false);
   const [uploadCount, setUploadCount] = React.useState(0);
   const draftIdRef = React.useRef<string>("");
@@ -3641,7 +3198,7 @@ function CreateTaskSheet({
   // absolute paths to the description; the task's agents open them by path via Read/Bash.
   async function pickFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
-    // crypto.randomUUID 仅在安全上下文可用(https/localhost);经 IP+http 访问时降级。
+    // crypto.randomUUID is only available in secure contexts (https/localhost); degrade when accessed via IP+http.
     if (!draftIdRef.current) {
       draftIdRef.current =
         globalThis.crypto?.randomUUID?.() ?? `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
@@ -3652,7 +3209,7 @@ function CreateTaskSheet({
       setDescription((prev) => appendUploads(prev, r.attachments));
       setUploadCount((n) => n + r.attachments.length);
     } catch (e) {
-      toast.error(translate("taskUI.uploadError", { message: taskError(e, translate) }));
+      toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = ""; // allow re-picking the same file
@@ -3661,50 +3218,39 @@ function CreateTaskSheet({
 
   async function createTask() {
     if (!description.trim() || !goal.trim()) {
-      toast.error(translate("taskUI.descriptionGoalRequired"));
+      toast.error(t("Please fill in the description and goal"));
       return;
     }
     if (sourceTaskIDs.length > MAX_SOURCE_TASKS) {
-      toast.error(translate("taskUI.sourceTaskLimit", { count: MAX_SOURCE_TASKS }));
-      return;
-    }
-    const workerCountNum = parseWorkerCountInput(workerCount);
-    if (workerCountNum == null) {
-      toast.error(translate("taskUI.invalidWorkers", { max: MAX_TASK_WORKER_COUNT }));
+      toast.error(t("Link up to {count} source tasks", { count: MAX_SOURCE_TASKS }));
       return;
     }
     setCreating(true);
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
-      const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 下限 10min，与后端归一一致
+      const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // minimum 10min, matching the backend's normalization
       await api.createTask({
         name: name.trim(),
-        remark: remark.trim(),
         categoryId: categoryID,
         description: description.trim(),
         goal: goal.trim(),
         llmProfileIds: llmProfileIDs.map(Number),
+        llmRotate,
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
         timeoutSeconds: timeoutSec,
-        noResultSeconds: Math.max(0, Math.floor((Number(noResultMin) || 0) * 60)),
-        noResultMinFindings: Math.max(1, Math.floor(Number(noResultCount) || 1)),
-        noResultMinSeverity: noResultSeverity,
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
-        shareGlobalAssets,
-        workerCount: workerCountNum,
-        schedule: scheduleEnabled
-          ? { ...schedule, name: schedule.name.trim() || translate("taskUI.defaultSchedule"), task_ids: [] }
-          : undefined,
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
+        credentials: credentials
+          .map((c) => ({ domain: c.domain.trim(), username: c.username.trim(), password: c.password, note: c.note?.trim() ?? "" }))
+          .filter((c) => c.domain !== "" && c.username !== ""),
       });
-      toast.success(translate("taskUI.taskCreated"));
+      toast.success(t("Task created"));
       setName("");
-      setRemark("");
       setCategoryID(undefined);
       setDescription("");
       setGoal("");
@@ -3712,34 +3258,18 @@ function CreateTaskSheet({
       setSourceTaskIDs([]);
       setCompanyIDs([]);
       setLLMProfileIDs([]);
+      setLLMRotate(false);
       setTimeoutMin("");
-      setNoResultMin("");
-      setNoResultCount("1");
-      setNoResultSeverity("");
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
-      setShareGlobalAssets(false);
-      setWorkerCount("");
       setInterceptRules([]);
-      setScheduleEnabled(false);
-      setSchedule({
-        name: translate("taskUI.defaultSchedule"),
-        schedule_type: "weekly",
-        end_date: "",
-        weekdays: [6, 7],
-        start_time: "18:00",
-        end_time: "",
-        task_ids: [],
-        timezone_mode: "beijing",
-        start_immediately: false,
-      });
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
       onCreated();
     } catch (e) {
-      toast.error(translate("taskUI.createError", { message: taskError(e, translate) }));
+      toast.error(t("Create failed: {error}", { error: (e as Error).message }));
     } finally {
       setCreating(false);
     }
@@ -3749,19 +3279,19 @@ function CreateTaskSheet({
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
         <Button size="sm">
-          <PlusIcon /> {translate("taskUI.newTask")}
+          <PlusIcon /> {t("New task")}
         </Button>
       </SheetTrigger>
-      {/* 45vw 宽的右侧抽屉:整屏高度可滚动,长表单不再受弹窗高度限制。窄屏退化为全宽。
-            内容为 flex 列:头/脚固定,中间字段区 flex-1 独立滚动。 */}
+      {/* A 45vw-wide right drawer: full-height and scrollable, so long forms are no longer bound by dialog height. Narrow screens fall back to full width.
+            The content is a flex column: header/footer fixed, the middle field area flex-1 scrolling independently. */}
       <SheetContent
         ref={sheetContentRef}
         side="right"
         className="w-full! max-w-none! gap-0 p-0 sm:w-[45vw]! sm:max-w-[45vw]!"
       >
         <SheetHeader className="border-b p-6">
-          <SheetTitle>{translate("taskUI.newTask")}</SheetTitle>
-          <SheetDescription>{translate("taskUI.newTaskHelp")}</SheetDescription>
+          <SheetTitle>{t("New task")}</SheetTitle>
+          <SheetDescription>{t("Fill in the test target and goal; advanced parameters can be expanded as needed.")}</SheetDescription>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-6">
@@ -3769,45 +3299,30 @@ function CreateTaskSheet({
             <TaskTemplateControls
               description={description}
               goal={goal}
-              remark={remark}
               categoryID={categoryID}
               interceptRules={interceptRules}
-              workerCount={workerCount}
               selectedTemplateID={selectedTemplateID}
               onSelectedTemplateIDChange={setSelectedTemplateID}
               onApply={(template) => {
                 setDescription(template.description);
                 setGoal(template.goal);
-                setRemark(template.remark ?? "");
                 setCategoryID(template.category_id ?? undefined);
                 setInterceptRules(template.intercept_rules ?? []);
-                setWorkerCount(template.worker_count ? String(template.worker_count) : "");
                 setUploadCount(0);
               }}
               portalContainer={sheetContentRef}
             />
             <div className="grid gap-2">
-              <Label htmlFor="name">{translate("taskUI.nameOptional")}</Label>
+              <Label htmlFor="name">{t("Name (optional)")}</Label>
               <Input
                 id="name"
-                placeholder={translate("taskUI.nameExample")}
+                placeholder={t("A recognizable name for the task, e.g. Acme website penetration test")}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
             </div>
-            <div className="grid gap-2">
-              <Label htmlFor="remark">{translate("taskUI.remarkOptional")}</Label>
-              <Textarea
-                id="remark"
-                className="min-h-20"
-                maxLength={MAX_TASK_REMARK_RUNES}
-                placeholder={translate("taskUI.remarkExample")}
-                value={remark}
-                onChange={(e) => setRemark(e.target.value)}
-              />
-            </div>
             <Field>
-              <FieldLabel htmlFor="task-category">{translate("taskUI.category")}</FieldLabel>
+              <FieldLabel htmlFor="task-category">{t("Task category")}</FieldLabel>
               <CategoryPicker
                 categories={categories}
                 value={categoryID}
@@ -3815,149 +3330,18 @@ function CreateTaskSheet({
                 onCategoryCreated={onCategoriesChanged}
                 portalContainer={sheetContentRef}
               />
-              <FieldDescription>{translate("taskUI.categoryHelp")}</FieldDescription>
+              <FieldDescription>{t("Optional, single category; used for task list filtering and archiving, never affecting agent execution.")}</FieldDescription>
             </Field>
-            <FieldSet>
-              <FieldLegend>{translate("taskUI.scheduleOptional")}</FieldLegend>
-              <label htmlFor={scheduleEnabledID} className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  id={scheduleEnabledID}
-                  checked={scheduleEnabled}
-                  onCheckedChange={(v) => setScheduleEnabled(!!v)}
-                />
-                {translate("taskUI.scheduleEnable")}
-              </label>
-              {scheduleEnabled && (
-                <FieldGroup className="rounded-lg border p-3">
-                  <Field>
-                    <FieldLabel>{translate("taskUI.scheduleName")}</FieldLabel>
-                    <Input
-                      placeholder={translate("taskUI.defaultSchedule")}
-                      value={schedule.name}
-                      onChange={(e) => setSchedule({ ...schedule, name: e.target.value })}
-                    />
-                  </Field>
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field>
-                      <FieldLabel>{translate("taskUI.rule")}</FieldLabel>
-                      <Select
-                        value={schedule.schedule_type}
-                        onValueChange={(value) =>
-                          setSchedule({
-                            ...schedule,
-                            schedule_type: value as ScheduleInput["schedule_type"],
-                          })
-                        }
-                      >
-                        <SelectTrigger className="h-10 w-full bg-background">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="weekly">{translate("taskUI.weekly")}</SelectItem>
-                          <SelectItem value="once">{translate("taskUI.once")}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </Field>
-                    <Field>
-                      <FieldLabel>{translate("taskUI.timezone")}</FieldLabel>
-                      <Select
-                        value={schedule.timezone_mode}
-                        onValueChange={(value) =>
-                          setSchedule({
-                            ...schedule,
-                            timezone_mode: value as ScheduleInput["timezone_mode"],
-                          })
-                        }
-                      >
-                        <SelectTrigger className="h-10 w-full bg-background">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="beijing">{translate("taskUI.beijing")}</SelectItem>
-                          <SelectItem value="system">{translate("taskUI.systemTimezone")}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </Field>
-                  </div>
-                  {schedule.schedule_type === "once" ? (
-                    <div className="grid grid-cols-2 gap-3">
-                      <Field>
-                        <FieldLabel>{translate("taskUI.startDate")}</FieldLabel>
-                        <DateSelect
-                          value={schedule.run_date ?? ""}
-                          onValueChange={(value) => setSchedule({ ...schedule, run_date: value })}
-                          aria-label={translate("taskUI.startDate")}
-                        />
-                      </Field>
-                      <Field>
-                        <FieldLabel>{translate("taskUI.endDateOptional")}</FieldLabel>
-                        <DateSelect
-                          value={schedule.end_date ?? ""}
-                          onValueChange={(value) => setSchedule({ ...schedule, end_date: value })}
-                          optional
-                          placeholder={translate("taskUI.noEndDate")}
-                          aria-label={translate("taskUI.endDateAccessible")}
-                        />
-                      </Field>
-                    </div>
-                  ) : (
-                    <Field>
-                      <FieldLabel>{translate("taskUI.weekdays")}</FieldLabel>
-                      <Input
-                        value={(schedule.weekdays ?? []).join(",")}
-                        onChange={(e) =>
-                          setSchedule({
-                            ...schedule,
-                            weekdays: e.target.value
-                              .split(",")
-                              .map(Number)
-                              .filter((n) => n >= 1 && n <= 7),
-                          })
-                        }
-                        placeholder={translate("taskUI.weekdaysExample")}
-                      />
-                    </Field>
-                  )}
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field>
-                      <FieldLabel>{translate("taskUI.startTime")}</FieldLabel>
-                      <TimeSelect
-                        value={schedule.start_time}
-                        onValueChange={(value) => setSchedule({ ...schedule, start_time: value })}
-                        aria-label={translate("taskUI.startTime")}
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel>{translate("taskUI.endTimeOptional")}</FieldLabel>
-                      <TimeSelect
-                        value={schedule.end_time ?? ""}
-                        onValueChange={(value) => setSchedule({ ...schedule, end_time: value })}
-                        optional
-                        aria-label={translate("taskUI.endTimeAccessible")}
-                      />
-                    </Field>
-                  </div>
-                  <label htmlFor={scheduleImmediateID} className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id={scheduleImmediateID}
-                      checked={schedule.start_immediately}
-                      onCheckedChange={(v) => setSchedule({ ...schedule, start_immediately: !!v })}
-                    />
-                    {translate("taskUI.startImmediately")}
-                  </label>
-                </FieldGroup>
-              )}
-            </FieldSet>
             <div className="grid gap-2">
-              <Label htmlFor="description">{translate("taskUI.description")}</Label>
+              <Label htmlFor="description">{t("Description")}</Label>
               <Textarea
                 id="description"
                 className="min-h-32"
-                placeholder={translate("taskUI.descriptionExample")}
+                placeholder={t("Test target and background, e.g. test the example.com site")}
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
               />
-              {/* 上传文件(可多选):暂存到 drafts/,把绝对路径追加进上方描述,worker 据此 Read/Bash 打开。 */}
+              {/* Upload files (multi-select): staged under drafts/, with absolute paths appended to the description above so the worker can open them with Read/Bash. */}
               <div className="flex flex-wrap items-center gap-2">
                 <input
                   ref={fileInputRef}
@@ -3974,170 +3358,175 @@ function CreateTaskSheet({
                   disabled={uploading}
                 >
                   {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
-                  {translate("taskUI.upload")}
+                  {t("Upload files")}
                 </Button>
                 <span className="text-muted-foreground text-xs">
                   {uploadCount > 0
-                    ? translate("taskUI.uploaded", { count: uploadCount })
-                    : translate("taskUI.uploadHelp")}
+                    ? t("{count} files uploaded; their absolute paths were appended to the end of the description (editable)", {
+                        count: uploadCount,
+                      })
+                    : t("Multi-select; after upload, absolute file paths are appended to the description for the worker to open with Read/Bash")}
                 </span>
               </div>
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="goal">{translate("taskUI.goal")}</Label>
+              <Label htmlFor="goal">{t("Goal")}</Label>
               <Textarea
                 id="goal"
                 className="min-h-32"
-                placeholder={translate("taskUI.goalExample")}
+                placeholder={t("What to achieve, e.g. gain admin panel access or server privileges")}
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
             <Field>
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="share-global-assets"
-                  checked={shareGlobalAssets}
-                  onCheckedChange={(checked) => setShareGlobalAssets(checked === true)}
-                />
-                <Label htmlFor="share-global-assets">{translate("taskUI.shareGlobal")}</Label>
-              </div>
-              <FieldDescription>{translate("taskUI.shareGlobalHelp")}</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="source-tasks">{translate("taskUI.linkedTasks")}</FieldLabel>
+              <FieldLabel htmlFor="source-tasks">{t("Linked tasks")}</FieldLabel>
               <SourceTaskPicker
                 tasks={tasks}
                 value={sourceTaskIDs}
                 onValueChange={setSourceTaskIDs}
                 portalContainer={sheetContentRef}
               />
-              <FieldDescription>{translate("taskUI.sourceHelp", { count: MAX_SOURCE_TASKS })}</FieldDescription>
+              <FieldDescription>
+                {t(
+                  "Link up to {count} tasks. Live, read-only inheritance of the selected tasks' persistent blackboards, asset scope, and related traffic; the new task writes to its own blackboard.",
+                  { count: MAX_SOURCE_TASKS },
+                )}
+              </FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="task-companies">{translate("taskUI.companyScope")}</FieldLabel>
+              <FieldLabel htmlFor="task-companies">{t("Linked company asset scope")}</FieldLabel>
               <CompanyPicker
                 companies={companies}
                 value={companyIDs}
                 onValueChange={setCompanyIDs}
                 portalContainer={sheetContentRef}
               />
-              <FieldDescription>{translate("taskUI.companyScopeHelp")}</FieldDescription>
+              <FieldDescription>
+                {t(
+                  "On task creation, the selected companies' current assets are added to \"Test assets\", and their domains, IPs, CIDRs, ICPs, and company keywords are provided to the agent as scope context; no intents are generated automatically and execution goals are not forced to change.",
+                )}
+              </FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="task-intercept-rules">{translate("taskUI.interceptOptional")}</FieldLabel>
+              <FieldLabel htmlFor="task-intercept-rules">{t("Task-level asset intercept / allow rules (optional)")}</FieldLabel>
               <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
-              <FieldDescription>{translate("taskUI.interceptHelp")}</FieldDescription>
+              <FieldDescription>
+                {t(
+                  "Applies to this task only and is not written to global rules. Evaluation order: \"Block\" rules (including global ones) match first, and a hit forbids testing; with no hit and \"Allow\" rules configured for this task, an asset must match an allow rule to be permitted, otherwise testing is likewise forbidden; with no allow rules configured, no whitelist is active.",
+                )}
+              </FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="llm-profiles">{translate("taskUI.llmChain")}</FieldLabel>
+              <FieldLabel htmlFor="llm-profiles">{t("LLM config chain")}</FieldLabel>
               <TaskLLMProfileChain
                 profiles={profiles}
                 value={llmProfileIDs}
+                rotate={llmRotate}
+                onRotateChange={setLLMRotate}
                 onValueChange={setLLMProfileIDs}
                 inputId="llm-profiles"
                 portalContainer={sheetContentRef}
               />
-              <FieldDescription>{translate("taskUI.llmChainHelp")}</FieldDescription>
+              <FieldDescription>
+                {t("Reorder profiles to choose worker rotation order or failover priority. Saving the chain resets exhausted profiles.")}
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="task-credentials">{t("Test accounts (optional)")}</FieldLabel>
+              <div className="grid gap-2">
+                {credentials.map((c, i) => (
+                  <div key={i} className="grid gap-2 sm:grid-cols-[1fr_1fr_1fr_auto]">
+                    <Input
+                      placeholder={t("domain (e.g. target.example.com)")}
+                      value={c.domain}
+                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, domain: e.target.value } : x)))}
+                    />
+                    <Input
+                      placeholder={t("email or username")}
+                      value={c.username}
+                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, username: e.target.value } : x)))}
+                    />
+                    <Input
+                      placeholder={t("password (empty = agent generates)")}
+                      value={c.password}
+                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, password: e.target.value } : x)))}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label={t("Remove account")}
+                      onClick={() => setCredentials((prev) => prev.filter((_, j) => j !== i))}
+                    >
+                      <TrashIcon />
+                    </Button>
+                    <Input
+                      className="sm:col-span-4"
+                      placeholder={t("note (optional, e.g. program alias account)")}
+                      value={c.note ?? ""}
+                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, note: e.target.value } : x)))}
+                    />
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() => setCredentials((prev) => [...prev, { domain: "", username: "", password: "", note: "" }])}
+                >
+                  <PlusIcon className="size-4" /> {t("Add account")}
+                </Button>
+              </div>
+              <FieldDescription>
+                {t(
+                  "Test accounts reused by the agent for authenticated testing. Leave the password empty to have the agent register that account itself and record the password it chose. Use dedicated test accounts only — anything declared here is sent to the configured LLM provider during the task.",
+                )}
+              </FieldDescription>
             </Field>
 
-            {/* 高级参数默认折叠:超时/心跳/首个意图,展开才占空间,常用路径保持清爽。 */}
+            {/* Advanced parameters are collapsed by default: timeout/heartbeat/first intent; they take space only when expanded, keeping the common path clean. */}
             <Collapsible>
               <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
                 <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
-                {translate("taskUI.advanced")}
-                <span className="text-muted-foreground ml-auto text-xs font-normal">
-                  {translate("taskUI.advancedSummary")}
-                </span>
+                {t("Advanced settings")}
+                <span className="text-muted-foreground ml-auto text-xs font-normal">{t("Timeout · Heartbeat · First intent")}</span>
               </CollapsibleTrigger>
               <CollapsibleContent className="grid gap-5 pt-5">
                 <div className="grid gap-2">
-                  <Label htmlFor="timeout-min">{translate("taskUI.timeoutOptional")}</Label>
+                  <Label htmlFor="timeout-min">{t("Task timeout (minutes, optional)")}</Label>
                   <Input
                     id="timeout-min"
                     type="number"
                     min={0}
                     className="w-40"
-                    placeholder={translate("taskUI.noTimeout")}
+                    placeholder={t("Empty = no limit")}
                     value={timeoutMin}
                     onChange={(e) => setTimeoutMin(e.target.value)}
                   />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.timeoutHelp")}</p>
+                  <p className="text-muted-foreground text-xs">
+                    {t(
+                      "When the time is up, a graceful wind-down is triggered (each agent writes back + the planner makes the final verdict) and the task enters the timeout terminal state.",
+                    )}
+                  </p>
                 </div>
                 <div className="grid gap-2">
-                  <Label htmlFor="no-result-min">{translate("taskUI.noResultOptional")}</Label>
-                  <Input
-                    id="no-result-min"
-                    type="number"
-                    min={0}
-                    className="w-40"
-                    placeholder="120"
-                    value={noResultMin}
-                    onChange={(e) => setNoResultMin(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.noResultHelp")}</p>
-                </div>
-                {Number(noResultMin) > 0 && (
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="grid gap-2">
-                      <Label htmlFor="no-result-count">{translate("taskUI.noResultCount")}</Label>
-                      <Input
-                        id="no-result-count"
-                        type="number"
-                        min={1}
-                        step={1}
-                        value={noResultCount}
-                        onChange={(e) => setNoResultCount(e.target.value)}
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="no-result-severity">{translate("taskUI.noResultSeverity")}</Label>
-                      <Select
-                        value={noResultSeverity || "any"}
-                        onValueChange={(v) =>
-                          setNoResultSeverity((v === "any" ? "" : v) as NonNullable<Task["no_result_min_severity"]>)
-                        }
-                      >
-                        <SelectTrigger id="no-result-severity">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="any">{translate("taskUI.noResultAnySeverity")}</SelectItem>
-                          <SelectItem value="low">{translate("taskUI.noResultLow")}</SelectItem>
-                          <SelectItem value="medium">{translate("taskUI.noResultMedium")}</SelectItem>
-                          <SelectItem value="high">{translate("taskUI.noResultHigh")}</SelectItem>
-                          <SelectItem value="critical">{translate("taskUI.noResultCritical")}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                )}
-                <div className="grid gap-2">
-                  <Label htmlFor="heartbeat-min">{translate("taskUI.heartbeat")}</Label>
+                  <Label htmlFor="heartbeat-min">{t("planner heartbeat (minutes)")}</Label>
                   <Input
                     id="heartbeat-min"
                     type="number"
                     min={10}
                     className="w-40"
-                    placeholder={translate("taskUI.defaultTen")}
+                    placeholder={t("Default 10")}
                     value={heartbeatMin}
                     onChange={(e) => setHeartbeatMin(e.target.value)}
                   />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.heartbeatHelp")}</p>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="worker-count">{translate("taskUI.workerCount")}</Label>
-                  <Input
-                    id="worker-count"
-                    type="number"
-                    min={0}
-                    max={MAX_TASK_WORKER_COUNT}
-                    className="w-40"
-                    placeholder={translate("taskUI.globalDefault")}
-                    value={workerCount}
-                    onChange={(e) => setWorkerCount(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.workerCountHelp")}</p>
+                  <p className="text-muted-foreground text-xs">
+                    {t(
+                      "When this much time has passed since the last planning round ended or the task started, with no triggers in between, a planning round fires automatically (deadlock backstop + wakes supervision of running workers). Minimum 10 minutes.",
+                    )}
+                  </p>
                 </div>
                 <div className="grid gap-2">
                   <label htmlFor="seed-first-intent" className="flex items-center gap-2 text-sm">
@@ -4146,9 +3535,13 @@ function CreateTaskSheet({
                       checked={seedFirstIntent}
                       onCheckedChange={(v) => setSeedFirstIntent(!!v)}
                     />
-                    {translate("taskUI.seedIntent")}
+                    {t("Dispatch the first intent directly (description + goal)")}
                   </label>
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.seedIntentHelp")}</p>
+                  <p className="text-muted-foreground text-xs">
+                    {t(
+                      "When enabled, the \"description + goal\" is dispatched as one intent right at creation; the worker starts without waiting for the first planning round and the planner takes over afterwards to judge/follow up. Recommended for settings like CTF where one run usually solves it directly; disabled follows the standard plan-then-execute flow.",
+                    )}
+                  </p>
                 </div>
                 <div className="grid gap-2">
                   <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
@@ -4157,9 +3550,13 @@ function CreateTaskSheet({
                       checked={coverageEnabled}
                       onCheckedChange={(v) => setCoverageEnabled(!!v)}
                     />
-                    {translate("taskUI.coverage")}
+                    {t("Asset coverage feature")}
                   </label>
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.coverageHelp")}</p>
+                  <p className="text-muted-foreground text-xs">
+                    {t(
+                      "On by default: computes and displays test coverage, shows testing progress on the situational graph, and automatically accumulates the test scope. When off, coverage is no longer computed or displayed, the situational graph shows assets without progress, and agents no longer receive scope-related tools. Disabling does not affect \"Linked company asset scope\".",
+                    )}
+                  </p>
                 </div>
               </CollapsibleContent>
             </Collapsible>
@@ -4168,11 +3565,11 @@ function CreateTaskSheet({
 
         <SheetFooter className="flex-row justify-end gap-2 border-t p-4">
           <SheetClose asChild>
-            <Button variant="outline">{translate("taskUI.cancel")}</Button>
+            <Button variant="outline">{t("Cancel")}</Button>
           </SheetClose>
           <Button onClick={createTask} disabled={creating || uploading}>
             {creating && <Spinner data-icon="inline-start" />}
-            {creating ? translate("taskUI.creating") : translate("taskUI.create")}
+            {creating ? t("Creating") : t("Create")}
           </Button>
         </SheetFooter>
       </SheetContent>

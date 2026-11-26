@@ -32,34 +32,21 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
-import { taskError } from "@/i18n/task-runtime";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { api } from "@/lib/api";
-import {
-  type AssetInterceptRuleInput,
-  MAX_TASK_REMARK_RUNES,
-  MAX_TASK_WORKER_COUNT,
-  parseWorkerCountInput,
-  type TaskCategory,
-  type TaskTemplate,
-} from "@/lib/types";
+import type { AssetInterceptRuleInput, TaskCategory, TaskTemplate } from "@/lib/types";
+import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 interface TemplateDraft {
   name: string;
   description: string;
   goal: string;
-  remark: string;
   categoryID: number | null;
   interceptRules: AssetInterceptRuleInput[];
-  workerCount: string; // 输入框用字符串;空/0=用全局默认
 }
 
-// TemplateSeed 是「另存为模板」时从创建表单带入的初值。
-type TemplateSeed = Pick<
-  TemplateDraft,
-  "description" | "goal" | "remark" | "categoryID" | "interceptRules" | "workerCount"
->;
+// TemplateSeed holds the initial values carried over from the creation form when using "Save as template".
+type TemplateSeed = Pick<TemplateDraft, "description" | "goal" | "categoryID" | "interceptRules">;
 
 interface TaskTemplateManagerProps {
   open: boolean;
@@ -75,10 +62,8 @@ const emptyDraft = (): TemplateDraft => ({
   name: "",
   description: "",
   goal: "",
-  remark: "",
   categoryID: null,
   interceptRules: [],
-  workerCount: "",
 });
 
 function templateDraft(template: TaskTemplate): TemplateDraft {
@@ -86,10 +71,8 @@ function templateDraft(template: TaskTemplate): TemplateDraft {
     name: template.name,
     description: template.description,
     goal: template.goal,
-    remark: template.remark ?? "",
     categoryID: template.category_id ?? null,
     interceptRules: template.intercept_rules ?? [],
-    workerCount: template.worker_count ? String(template.worker_count) : "",
   };
 }
 
@@ -102,7 +85,6 @@ function TaskTemplateManager({
   onUpdated,
   onDeleted,
 }: TaskTemplateManagerProps) {
-  const { t: translate } = useLiveTranslation();
   const [selectedID, setSelectedID] = React.useState<number | null>(null);
   const [draft, setDraft] = React.useState<TemplateDraft>(emptyDraft);
   const [saving, setSaving] = React.useState(false);
@@ -127,10 +109,8 @@ function TaskTemplateManager({
           name: "",
           description: seed.description,
           goal: seed.goal,
-          remark: seed.remark,
           categoryID: seed.categoryID,
           interceptRules: seed.interceptRules,
-          workerCount: seed.workerCount,
         });
       } else if (templates[0]) {
         setSelectedID(templates[0].id);
@@ -153,7 +133,7 @@ function TaskTemplateManager({
     setDraft(emptyDraft());
   };
 
-  const updateDraft = (field: "name" | "description" | "goal" | "remark" | "workerCount", value: string) => {
+  const updateDraft = (field: "name" | "description" | "goal", value: string) => {
     setDraft((current) => ({ ...current, [field]: value }));
   };
 
@@ -162,24 +142,17 @@ function TaskTemplateManager({
   };
 
   async function save() {
-    const workerCount = parseWorkerCountInput(draft.workerCount);
-    if (workerCount == null) {
-      toast.error(translate("taskUI.invalidWorkers", { max: MAX_TASK_WORKER_COUNT }));
-      return;
-    }
     const input = {
       name: draft.name.trim(),
       description: draft.description.trim(),
       goal: draft.goal.trim(),
-      remark: draft.remark.trim(),
       category_id: draft.categoryID,
-      worker_count: workerCount,
       intercept_rules: draft.interceptRules
         .map((r) => ({ ...r, pattern: r.pattern.trim() }))
         .filter((r) => r.pattern !== ""),
     };
     if (!input.name || !input.description || !input.goal) {
-      toast.error(translate("taskUI.templateRequired"));
+      toast.error(t("Fill in the template name, description, and goal"));
       return;
     }
     setSaving(true);
@@ -189,15 +162,15 @@ function TaskTemplateManager({
         onCreated(created);
         setSelectedID(created.id);
         setDraft(templateDraft(created));
-        toast.success(translate("taskUI.templateCreated"));
+        toast.success(t("Template created"));
       } else {
         const updated = await api.updateTaskTemplate(selectedID, input);
         onUpdated(updated);
         setDraft(templateDraft(updated));
-        toast.success(translate("taskUI.templateUpdated"));
+        toast.success(t("Template updated"));
       }
     } catch (error) {
-      toast.error(translate("taskUI.saveFailed", { message: taskError(error, translate) }));
+      toast.error(t("Save failed: {error}", { error: (error as Error).message }));
     } finally {
       setSaving(false);
     }
@@ -218,37 +191,39 @@ function TaskTemplateManager({
         startNew();
       }
       setDeleteOpen(false);
-      toast.success(translate("taskUI.templateDeleted"));
+      toast.success(t("Template deleted"));
     } catch (error) {
-      toast.error(translate("taskUI.deleteError", { message: taskError(error, translate) }));
+      toast.error(t("Delete failed: {error}", { error: (error as Error).message }));
     } finally {
       setDeleting(false);
     }
   }
 
-  let saveLabel = saving ? translate("taskUI.saving") : translate("taskUI.saveChanges");
-  if (!saving && selectedID == null) saveLabel = translate("taskUI.createTemplate");
+  let saveLabel = saving ? t("Saving") : t("Save changes");
+  if (!saving && selectedID == null) saveLabel = t("Create template");
 
   return (
     <>
       <Sheet open={open} onOpenChange={onOpenChange}>
         <SheetContent className="grid h-full w-full! max-w-none! grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
           <SheetHeader className="border-b px-6 py-5">
-            <SheetTitle>{translate("taskUI.templateManagement")}</SheetTitle>
-            <SheetDescription>{translate("taskUI.templateManagementHelp")}</SheetDescription>
+            <SheetTitle>{t("Task template management")}</SheetTitle>
+            <SheetDescription>
+              {t(
+                "Templates store the description, goal, category, and task-level intercept/allow rules; edits do not affect already-created tasks.",
+              )}
+            </SheetDescription>
           </SheetHeader>
           <div className="grid min-h-0 overflow-y-auto lg:grid-cols-[15rem_minmax(0,1fr)] lg:overflow-hidden">
             <div className="flex min-h-0 flex-col border-b p-3 lg:border-r lg:border-b-0">
               <Button type="button" variant="outline" className="w-full" onClick={startNew}>
                 <PlusIcon data-icon="inline-start" />
-                {translate("taskUI.newTemplate")}
+                {t("Create template")}
               </Button>
               <ScrollArea className="mt-2 max-h-44 lg:max-h-none lg:flex-1">
                 <div className="flex flex-col gap-1 pr-2">
                   {templates.length === 0 && (
-                    <p className="px-2 py-6 text-center text-muted-foreground text-sm">
-                      {translate("taskUI.noTemplates")}
-                    </p>
+                    <p className="px-2 py-6 text-center text-muted-foreground text-sm">{t("No templates yet")}</p>
                   )}
                   {templates.map((template) => (
                     <button
@@ -262,11 +237,6 @@ function TaskTemplateManager({
                     >
                       <span className="block truncate font-medium text-sm">{template.name}</span>
                       <span className="block truncate text-muted-foreground text-xs">{template.description}</span>
-                      {template.remark ? (
-                        <span className="block truncate text-muted-foreground/80 text-xs">
-                          {translate("taskUI.templateRemark", { remark: template.remark })}
-                        </span>
-                      ) : null}
                     </button>
                   ))}
                 </div>
@@ -275,62 +245,37 @@ function TaskTemplateManager({
             <ScrollArea className="min-h-0">
               <FieldGroup className="p-6">
                 <Field>
-                  <FieldLabel htmlFor="task-template-name">{translate("taskUI.templateName")}</FieldLabel>
+                  <FieldLabel htmlFor="task-template-name">{t("Template name")}</FieldLabel>
                   <Input
                     id="task-template-name"
                     value={draft.name}
                     maxLength={120}
-                    placeholder={translate("taskUI.templateExample")}
+                    placeholder={t("e.g. External web penetration testing")}
                     onChange={(event) => updateDraft("name", event.target.value)}
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="task-template-description">{translate("taskUI.description")}</FieldLabel>
+                  <FieldLabel htmlFor="task-template-description">{t("Description")}</FieldLabel>
                   <Textarea
                     id="task-template-description"
                     className="min-h-28"
                     value={draft.description}
-                    placeholder={translate("taskUI.targetContext")}
+                    placeholder={t("Test target and background")}
                     onChange={(event) => updateDraft("description", event.target.value)}
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="task-template-goal">{translate("taskUI.goal")}</FieldLabel>
+                  <FieldLabel htmlFor="task-template-goal">{t("Goal")}</FieldLabel>
                   <Textarea
                     id="task-template-goal"
                     className="min-h-28"
                     value={draft.goal}
-                    placeholder={translate("taskUI.goalPlaceholder")}
+                    placeholder={t("Goals the task needs to achieve")}
                     onChange={(event) => updateDraft("goal", event.target.value)}
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="task-template-remark">{translate("taskUI.remarkOptional")}</FieldLabel>
-                  <Textarea
-                    id="task-template-remark"
-                    className="min-h-20"
-                    maxLength={MAX_TASK_REMARK_RUNES}
-                    value={draft.remark}
-                    placeholder={translate("taskUI.templateNotesPlaceholder")}
-                    onChange={(event) => updateDraft("remark", event.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="task-template-worker-count">{translate("taskUI.workerCount")}</FieldLabel>
-                  <Input
-                    id="task-template-worker-count"
-                    type="number"
-                    min={0}
-                    max={MAX_TASK_WORKER_COUNT}
-                    className="w-40"
-                    placeholder={translate("taskUI.globalDefault")}
-                    value={draft.workerCount}
-                    onChange={(event) => updateDraft("workerCount", event.target.value)}
-                  />
-                  <FieldDescription>{translate("taskUI.templateWorkersHelp")}</FieldDescription>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="task-template-category">{translate("taskUI.category")}</FieldLabel>
+                  <FieldLabel htmlFor="task-template-category">{t("Task category")}</FieldLabel>
                   <NativeSelect
                     id="task-template-category"
                     className="w-full"
@@ -339,22 +284,24 @@ function TaskTemplateManager({
                       patchDraft({ categoryID: event.target.value === "" ? null : Number(event.target.value) })
                     }
                   >
-                    <NativeSelectOption value="">{translate("taskUI.uncategorized")}</NativeSelectOption>
+                    <NativeSelectOption value="">{t("Uncategorized")}</NativeSelectOption>
                     {categories.map((c) => (
                       <NativeSelectOption key={c.id} value={String(c.id)}>
                         {c.name}
                       </NativeSelectOption>
                     ))}
                   </NativeSelect>
-                  <FieldDescription>{translate("taskUI.templateCategoryHelp")}</FieldDescription>
+                  <FieldDescription>{t("This category is prefilled when the template is applied (still editable).")}</FieldDescription>
                 </Field>
                 <Field>
-                  <FieldLabel>{translate("taskUI.templateRules")}</FieldLabel>
+                  <FieldLabel>{t("Task-level intercept / allow rules")}</FieldLabel>
                   <AssetInterceptRulesEditor
                     value={draft.interceptRules}
                     onChange={(rules) => patchDraft({ interceptRules: rules })}
                   />
-                  <FieldDescription>{translate("taskUI.templateRulesHelp")}</FieldDescription>
+                  <FieldDescription>
+                    {t("These task-level rules are prefilled when the template is applied (intercept/allow, effective only for new tasks, never global).")}
+                  </FieldDescription>
                 </Field>
               </FieldGroup>
             </ScrollArea>
@@ -363,11 +310,11 @@ function TaskTemplateManager({
             {selectedID != null && (
               <Button type="button" variant="destructive" className="sm:mr-auto" onClick={() => setDeleteOpen(true)}>
                 <Trash2Icon data-icon="inline-start" />
-                {translate("taskUI.deleteTemplate")}
+                {t("Delete template")}
               </Button>
             )}
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {translate("taskUI.close")}
+              {t("Close")}
             </Button>
             <Button type="button" disabled={saving} onClick={() => void save()}>
               {saving ? <Spinner data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
@@ -379,13 +326,11 @@ function TaskTemplateManager({
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              {translate("taskUI.confirmDeleteTemplate", { name: draft.name || translate("taskUI.untitledTemplate") })}
-            </AlertDialogTitle>
-            <AlertDialogDescription>{translate("taskUI.deleteTemplateHelp")}</AlertDialogDescription>
+            <AlertDialogTitle>{t('Delete template "{name}"?', { name: draft.name || t("Untitled template") })}</AlertDialogTitle>
+            <AlertDialogDescription>{t("Tasks already created from this template are not affected.")}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleting}>{translate("taskUI.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleting}>{t("Cancel")}</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={deleting}
@@ -395,7 +340,7 @@ function TaskTemplateManager({
               }}
             >
               {deleting && <Spinner data-icon="inline-start" />}
-              {deleting ? translate("taskUI.deleting") : translate("taskUI.delete")}
+              {deleting ? t("Deleting") : t("Delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -407,10 +352,8 @@ function TaskTemplateManager({
 interface TaskTemplateControlsProps {
   description: string;
   goal: string;
-  remark?: string;
   categoryID?: number;
   interceptRules?: AssetInterceptRuleInput[];
-  workerCount?: string;
   selectedTemplateID: number | null;
   onSelectedTemplateIDChange: (id: number | null) => void;
   onApply: (template: TaskTemplate) => void;
@@ -420,16 +363,13 @@ interface TaskTemplateControlsProps {
 export function TaskTemplateControls({
   description,
   goal,
-  remark = "",
   categoryID,
   interceptRules,
-  workerCount = "",
   selectedTemplateID,
   onSelectedTemplateIDChange,
   onApply,
   portalContainer,
 }: TaskTemplateControlsProps) {
-  const { t: translate, liveT } = useLiveTranslation();
   const [templates, setTemplates] = React.useState<TaskTemplate[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [templateInputValue, setTemplateInputValue] = React.useState("");
@@ -443,11 +383,11 @@ export function TaskTemplateControls({
       setTemplates(await api.taskTemplates());
     } catch (error) {
       setTemplates([]);
-      toast.error(liveT("taskUI.loadTemplatesFailed", { message: taskError(error, liveT) }));
+      toast.error(t("Failed to load templates: {error}", { error: (error as Error).message }));
     } finally {
       setLoading(false);
     }
-  }, [liveT]);
+  }, []);
 
   React.useEffect(() => {
     void loadTemplates();
@@ -475,18 +415,8 @@ export function TaskTemplateControls({
       return;
     }
     setTemplateInputValue(template.name);
-    const currentWorkerCount = parseWorkerCountInput(workerCount);
-    const templateWorkerCount = template.worker_count ?? 0;
-    const hasContent =
-      description.trim() !== "" ||
-      goal.trim() !== "" ||
-      remark.trim() !== "" ||
-      (currentWorkerCount == null ? workerCount.trim() !== "" : currentWorkerCount !== 0);
-    const changesContent =
-      description !== template.description ||
-      goal !== template.goal ||
-      remark !== (template.remark ?? "") ||
-      (currentWorkerCount == null ? workerCount.trim() !== "" : currentWorkerCount !== templateWorkerCount);
+    const hasContent = description.trim() !== "" || goal.trim() !== "";
+    const changesContent = description !== template.description || goal !== template.goal;
     if (hasContent && changesContent) {
       setPendingTemplate(template);
       return;
@@ -508,18 +438,18 @@ export function TaskTemplateControls({
     if (selectedTemplateID === id) onSelectedTemplateIDChange(null);
   };
 
-  let pickerPlaceholder = loading ? translate("taskUI.loadingTemplates") : translate("taskUI.noTaskTemplates");
-  if (!loading && templates.length > 0) pickerPlaceholder = translate("taskUI.searchTemplates");
+  let pickerPlaceholder = loading ? t("Loading templates") : t("No task templates yet");
+  if (!loading && templates.length > 0) pickerPlaceholder = t("Search and select a task template");
 
   return (
     <>
       <Field>
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <FieldLabel htmlFor="task-template-picker">{translate("taskUI.taskTemplates")}</FieldLabel>
+          <FieldLabel htmlFor="task-template-picker">{t("Task template")}</FieldLabel>
           <div className="flex flex-wrap gap-2">
             <Button type="button" variant="ghost" size="sm" onClick={() => openManager(null)}>
               <Settings2Icon data-icon="inline-start" />
-              {translate("taskUI.manageTemplates")}
+              {t("Manage templates")}
             </Button>
             <Button
               type="button"
@@ -530,15 +460,13 @@ export function TaskTemplateControls({
                 openManager({
                   description,
                   goal,
-                  remark,
                   categoryID: categoryID ?? null,
                   interceptRules: interceptRules ?? [],
-                  workerCount,
                 })
               }
             >
               <SaveIcon data-icon="inline-start" />
-              {translate("taskUI.saveAsTemplate")}
+              {t("Save as template")}
             </Button>
           </div>
         </div>
@@ -559,7 +487,7 @@ export function TaskTemplateControls({
             showClear
           />
           <ComboboxContent portalContainer={portalContainer}>
-            <ComboboxEmpty>{translate("taskUI.noMatchingTemplates")}</ComboboxEmpty>
+            <ComboboxEmpty>{t("No matching templates")}</ComboboxEmpty>
             <ComboboxList>
               {(template) => (
                 <ComboboxItem key={template.id} value={template}>
@@ -575,7 +503,11 @@ export function TaskTemplateControls({
             </ComboboxList>
           </ComboboxContent>
         </Combobox>
-        <FieldDescription>{translate("taskUI.applyTemplateHelp")}</FieldDescription>
+        <FieldDescription>
+          {t(
+            "Selecting copies the template's description, goal, category, and task-level rules; no link to the template is kept.",
+          )}
+        </FieldDescription>
       </Field>
 
       <AlertDialog
@@ -588,15 +520,15 @@ export function TaskTemplateControls({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              {translate("taskUI.confirmApplyTemplate", { name: pendingTemplate?.name })}
-            </AlertDialogTitle>
-            <AlertDialogDescription>{translate("taskUI.overwriteTemplateHelp")}</AlertDialogDescription>
+            <AlertDialogTitle>{t('Use template "{name}"?', { name: pendingTemplate?.name ?? "" })}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("The description and goal already filled in will be overwritten by the template.")}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{translate("taskUI.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
             <AlertDialogAction onClick={() => pendingTemplate && applyTemplate(pendingTemplate)}>
-              {translate("taskUI.overwrite")}
+              {t("Overwrite and use")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	TaskArchiveFormatVersion       = 4
+	TaskArchiveFormatVersion       = 3
 	TaskArchiveLegacyFormatVersion = 1
 	TaskArchiveLLMRecordsPath      = "database/llm_records.ndjson"
 )
@@ -60,6 +60,7 @@ type TaskArchive struct {
 	Warnings                json.RawMessage `json:"warnings"`
 	FormatVersion           int             `json:"format_version"`
 	ArchivePath             string          `json:"-"`
+	Storage                 string          `json:"storage,omitempty"`
 	SHA256                  string          `json:"sha256,omitempty"`
 	OriginalSize            int64           `json:"original_size"`
 	CompressedSize          int64           `json:"compressed_size"`
@@ -79,15 +80,20 @@ type TaskArchive struct {
 	UpdatedAt               time.Time       `json:"updated_at"`
 }
 
+// archiveBlockerScope selects the live direct dependents that block archiving
+// their source task. TaskArchiveBlockers and TaskArchiveBlocker share it so the
+// list and the detail view cannot disagree.
+const archiveBlockerScope = `
+FROM task_relations relation
+JOIN tasks child ON child.id=relation.task_id AND child.deleted_at IS NULL
+LEFT JOIN task_archives pending ON pending.task_id=child.id
+WHERE (pending.id IS NULL OR pending.state NOT IN ('archive_queued','archiving'))`
+
 // TaskArchiveBlockers returns one live direct dependent for every source task
 // that cannot currently be archived. Dependents already queued for archiving do
 // not block their source because the FIFO worker will compact them first.
 func (d *DB) TaskArchiveBlockers() (map[int64]int64, error) {
-	rows, err := d.Query(`SELECT relation.source_task_id, MIN(child.id)
-FROM task_relations relation
-JOIN tasks child ON child.id=relation.task_id AND child.deleted_at IS NULL
-LEFT JOIN task_archives pending ON pending.task_id=child.id
-WHERE pending.id IS NULL OR pending.state NOT IN ('archive_queued','archiving')
+	rows, err := d.Query(`SELECT relation.source_task_id, MIN(child.id)` + archiveBlockerScope + `
 GROUP BY relation.source_task_id`)
 	if err != nil {
 		return nil, err
@@ -102,6 +108,18 @@ GROUP BY relation.source_task_id`)
 		blockers[sourceID] = dependentID
 	}
 	return blockers, rows.Err()
+}
+
+// TaskArchiveBlocker returns the live direct dependent that blocks taskID, or
+// 0 when nothing blocks it. Same rules as TaskArchiveBlockers, scoped to one
+// source task so getTask does not aggregate the whole relation table per poll.
+func (d *DB) TaskArchiveBlocker(taskID int64) (int64, error) {
+	var dependent sql.NullInt64
+	if err := d.QueryRow(`SELECT MIN(child.id)`+archiveBlockerScope+`
+AND relation.source_task_id=$1`, taskID).Scan(&dependent); err != nil {
+		return 0, err
+	}
+	return dependent.Int64, nil
 }
 
 type TaskArchivePage struct {
@@ -143,6 +161,12 @@ func scanTaskArchive(sc interface{ Scan(...any) error }) (*TaskArchive, error) {
 	)
 	if err != nil {
 		return nil, err
+	}
+	if item.ArchivePath != "" {
+		item.Storage = "local"
+		if strings.HasPrefix(item.ArchivePath, "s3://") {
+			item.Storage = "s3"
+		}
 	}
 	if err := json.Unmarshal([]byte(sources), &item.SourceTaskIDs); err != nil {
 		return nil, err
@@ -361,7 +385,7 @@ func (d *DB) RecoverTaskArchiveJobs() error {
 	                  WHEN 'restoring' THEN 'restore_queued'
 	                  WHEN 'deleting' THEN 'delete_queued' ELSE state END,
 	 phase='interrupted',
-	 error=CASE WHEN state='archiving' THEN '上次归档进程异常退出，请手动重试' ELSE '' END
+	 error=CASE WHEN state='archiving' THEN 'the previous archive process exited abnormally; please retry manually' ELSE '' END
 	WHERE state IN ('archiving','restoring','deleting')`)
 	return err
 }
@@ -432,7 +456,10 @@ func (d *DB) FailTaskArchiveJob(id int64, activeState string, cause error) error
 	if cause != nil {
 		message = cause.Error()
 	}
-	_, err := d.Exec(`UPDATE task_archives SET state=$2,phase='failed',error=$3 WHERE id=$1`, id, failed, message)
+	// Only a job still in its active state fails. The worker also reports a panic
+	// it recovered after the job committed: a ready archive marked archive_failed
+	// could be neither restored nor deleted.
+	_, err := d.Exec(`UPDATE task_archives SET state=$2,phase='failed',error=$3 WHERE id=$1 AND state=$4`, id, failed, message, activeState)
 	return err
 }
 
@@ -533,10 +560,7 @@ UNION SELECT anchor.asset_id FROM exploration_anchors anchor
 UNION SELECT value::bigint FROM findings finding
       CROSS JOIN LATERAL jsonb_array_elements_text(
         CASE WHEN jsonb_typeof(finding.asset_ids)='array' THEN finding.asset_ids ELSE '[]'::jsonb END
-      ) value WHERE finding.task_id=$1 AND value ~ '^[0-9]+$'
-UNION SELECT value::bigint FROM task_intelligence intelligence
-      CROSS JOIN LATERAL jsonb_array_elements_text(intelligence.asset_ids) value
-      WHERE intelligence.task_id=$1 AND value ~ '^[0-9]+$'`
+      ) value WHERE finding.task_id=$1 AND value ~ '^[0-9]+$'`
 }
 
 // SnapshotTaskArchive reads one repeatable PostgreSQL snapshot. Task-owned Agent
@@ -590,7 +614,6 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"task_llm_profiles", `SELECT * FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, []any{taskID}},
 		{"task_scope", `SELECT * FROM task_scope WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"findings", `SELECT * FROM findings WHERE task_id=$1 ORDER BY id`, []any{taskID}},
-		{"task_intelligence", `SELECT * FROM task_intelligence WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"finding_traffic_bindings", `SELECT b.* FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1 ORDER BY b.finding_id,b.position,b.id`, []any{taskID}},
 		{"traffic_evidence_snapshots", `SELECT s.* FROM traffic_evidence_snapshots s WHERE EXISTS(SELECT 1 FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE b.snapshot_id=s.id AND f.task_id=$1) ORDER BY s.id`, []any{taskID}},
 		{"llm_records", `SELECT * FROM llm_records WHERE COALESCE(task_id,'')=$1 ORDER BY id`, []any{strconv.FormatInt(taskID, 10)}},
@@ -757,6 +780,8 @@ FROM skill_usage WHERE (task_id=$1 OR exploration_id=$2) AND NOT found GROUP BY 
 		{"findings", `SELECT COALESCE(jsonb_object_agg(name,n),'{}'::jsonb) FROM (SELECT COALESCE(NULLIF(severity,''),'unknown') name,count(*) n FROM findings WHERE task_id=$1 GROUP BY severity) x`, []any{taskID}},
 		{"finding_stats", `SELECT jsonb_build_object(
  'total',count(*),'pending',count(*) FILTER (WHERE status='pending'),
+ 'submitted',count(*) FILTER (WHERE report_state='submitted'),
+ 'accepted',count(*) FILTER (WHERE report_state='accepted'),
  'critical',count(*) FILTER (WHERE severity='critical'),'high',count(*) FILTER (WHERE severity='high'),
  'medium',count(*) FILTER (WHERE severity='medium'),'low',count(*) FILTER (WHERE severity='low'),
  'vulnclasses',COALESCE(jsonb_agg(DISTINCT vulnclass) FILTER (WHERE vulnclass<>''),'[]'::jsonb))

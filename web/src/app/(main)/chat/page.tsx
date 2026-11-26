@@ -22,10 +22,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
+import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
@@ -53,9 +53,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { agentDisplayName } from "@/i18n/agent-display";
-import { localizedError } from "@/i18n/errors";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { mergeActivities } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
@@ -63,6 +60,7 @@ import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.
 import { isBtwCommand } from "@/lib/side-questions";
 import type { Activity, Agent, ChatAttachment, Conversation, LLMProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { intlLocale, t } from "@/i18n";
 
 // fmtBytes renders a human file size for attachment chips (mirrors transcript.tsx).
 function fmtBytes(n: number): string {
@@ -134,14 +132,13 @@ function groupByAgent(conversations: Conversation[], agentByKey: Map<string, Age
   return [...groups.values()];
 }
 
-// LiveBadge is the small pulsing "实时" chip reused from the task's main-agent
+// LiveBadge is the small pulsing "live" chip reused from the task's main-agent
 // console — shown while a turn is streaming.
 function LiveBadge() {
-  const { t: translate } = useLiveTranslation();
   return (
     <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
       <span className="size-1 animate-pulse rounded-full bg-blue-500" />
-      {translate("overview.live")}
+      {t("Live")}
     </span>
   );
 }
@@ -173,17 +170,16 @@ function Composer({
   running?: boolean;
   onStop?: () => void;
   stopDisabled?: boolean;
-  // 方式1 文件上传:传了 onPickFiles 才显示回形针按钮 + 附件 chip 预览。
+  // Upload method 1: the paperclip button + attachment chip preview only appear when onPickFiles is provided.
   attachments?: ChatAttachment[];
   onPickFiles?: (files: File[]) => void;
   onRemoveAttachment?: (path: string) => void;
   uploading?: boolean;
   allowBtw?: boolean;
 }) {
-  const { t: translate } = useLiveTranslation();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const atts = attachments ?? [];
-  // 发送键位由系统设置决定（localStorage），默认 Enter 发送。
+  // The send key binding comes from system settings (localStorage); Enter sends by default.
   const sendMode = useChatSendMode();
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (!shouldSubmitOnKey(e, sendMode)) return;
@@ -208,7 +204,7 @@ function Composer({
                   type="button"
                   className="ml-0.5 text-muted-foreground hover:text-foreground"
                   onClick={() => onRemoveAttachment(a.path)}
-                  title={translate("overview.remove")}
+                  title={t("Remove")}
                 >
                   <XIcon className="size-3" />
                 </button>
@@ -227,8 +223,8 @@ function Composer({
               multiple
               className="hidden"
               onChange={(e) => {
-                // FileList 与 input 元素活绑定:必须先快照成数组,再清空 value,
-                // 否则异步的 onPickFiles(比如草稿态要先建会话)恢复执行时会拿到空列表。
+                // A FileList is live-bound to the input element: snapshot it into an array first, then clear value,
+                // otherwise the async onPickFiles (which may need to create a conversation first in draft mode) resumes with an empty list.
                 const picked = Array.from(e.target.files ?? []);
                 e.target.value = ""; // allow re-picking the same file
                 if (picked.length > 0) onPickFiles(picked);
@@ -239,7 +235,7 @@ function Composer({
               variant="ghost"
               onClick={() => fileInputRef.current?.click()}
               disabled={disabled || uploading}
-              title={translate("overview.uploadFile")}
+              title={t("Upload files")}
             >
               {uploading ? <Loader2Icon className="size-4 animate-spin" /> : <PaperclipIcon className="size-4" />}
             </Button>
@@ -255,25 +251,14 @@ function Composer({
           onKeyDown={onKeyDown}
         />
         {running && allowBtw && isBtwCommand(value) && (
-          <Button
-            size="icon"
-            onClick={onSend}
-            aria-label={translate("overview.sendSideQuestion")}
-            title={translate("overview.sendSideQuestion")}
-          >
+          <Button size="icon" onClick={onSend} aria-label={t("Send side question")} title={t("Send side question")}>
             <ArrowUpIcon />
           </Button>
         )}
         {running ? (
           // while a run is in flight the send button becomes a stop button —
           // aborts just this session (the trigger queue keeps going).
-          <Button
-            size="icon"
-            variant="destructive"
-            onClick={onStop}
-            disabled={stopDisabled}
-            title={translate("overview.stopRun")}
-          >
+          <Button size="icon" variant="destructive" onClick={onStop} disabled={stopDisabled} title={t("Stop this run")}>
             <Square className="size-3.5 fill-current" />
           </Button>
         ) : (
@@ -281,8 +266,8 @@ function Composer({
             size="icon"
             onClick={onSend}
             disabled={disabled || (!value.trim() && atts.length === 0)}
-            title={translate("overview.sendMessage")}
-            aria-label={translate("overview.sendMessage")}
+            title={t("Send message")}
+            aria-label={t("Send message")}
           >
             <ArrowUpIcon />
           </Button>
@@ -307,15 +292,14 @@ function LLMProfileRow({
   disabled?: boolean;
   rightSlot?: React.ReactNode;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const activeDefault = profiles.find((p) => p.is_default);
   const current = selected != null ? profiles.find((p) => Number(p.id) === selected) : null;
   const label = current
     ? current.name
     : activeDefault
-      ? translate("overview.defaultProfileWithName", { name: activeDefault.name })
-      : translate("overview.default");
+      ? t("Default ({name})", { name: activeDefault.name })
+      : t("Default");
 
   return (
     <div className="flex min-w-0 shrink-0 items-center gap-1 px-1 pt-0.5 pb-1">
@@ -330,14 +314,12 @@ function LLMProfileRow({
             disabled={disabled}
             className="flex shrink-0 items-center gap-0.5 text-primary text-xs hover:underline disabled:pointer-events-none disabled:opacity-40"
           >
-            {translate("overview.change")}
+            {t("Change")}
             <ChevronDownIcon className="size-3" />
           </button>
         </PopoverTrigger>
         <PopoverContent align="start" className="w-64 p-1">
-          <p className="text-muted-foreground px-2 py-1 text-[11px] font-medium">
-            {translate("overview.chooseProfile")}
-          </p>
+          <p className="text-muted-foreground px-2 py-1 text-[11px] font-medium">{t("Select an LLM profile")}</p>
           {/* default option */}
           <button
             type="button"
@@ -351,9 +333,7 @@ function LLMProfileRow({
             )}
           >
             <span className="text-sm">
-              {activeDefault
-                ? translate("overview.defaultProfileWithName", { name: activeDefault.name })
-                : translate("overview.default")}
+              {activeDefault ? t("Default ({name})", { name: activeDefault.name }) : t("Default")}
             </span>
             {activeDefault && (
               <span className="text-muted-foreground text-[11px]">
@@ -361,27 +341,25 @@ function LLMProfileRow({
               </span>
             )}
           </button>
-          {profiles
-            .filter((p) => p.format !== "jev")
-            .map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => {
-                  onChange(Number(p.id));
-                  setOpen(false);
-                }}
-                className={cn(
-                  "flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-accent",
-                  selected === Number(p.id) && "bg-accent",
-                )}
-              >
-                <span className="text-sm">{p.name}</span>
-                <span className="text-muted-foreground text-[11px]">
-                  {p.format} · {p.model}
-                </span>
-              </button>
-            ))}
+          {profiles.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => {
+                onChange(Number(p.id));
+                setOpen(false);
+              }}
+              className={cn(
+                "flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-accent",
+                selected === Number(p.id) && "bg-accent",
+              )}
+            >
+              <span className="text-sm">{p.name}</span>
+              <span className="text-muted-foreground text-[11px]">
+                {p.format} · {p.model}
+              </span>
+            </button>
+          ))}
         </PopoverContent>
       </Popover>
       {rightSlot}
@@ -402,7 +380,6 @@ function DraftChat({
   profiles: LLMProfile[];
   onStarted: (c: Conversation, pending?: { input?: string; attachments?: ChatAttachment[] }) => void;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [agentKey, setAgentKey] = React.useState("");
   const [llmProfileId, setLlmProfileId] = React.useState<number | null>(null);
   const [input, setInput] = React.useState("");
@@ -425,7 +402,7 @@ function DraftChat({
       await api.sendConversationMessage(c.id, msg);
       onStarted(c);
     } catch (e) {
-      toast.error(translate("overview.sendFailedPrefix") + localizedError(e, translate));
+      toast.error(t("Send failed: {error}", { error: (e as Error).message }));
       setSending(false);
     }
   }
@@ -443,7 +420,7 @@ function DraftChat({
       const r = await api.chatUpload("session", `conv-${c.id}`, files);
       onStarted(c, { input, attachments: r.attachments });
     } catch (e) {
-      toast.error(translate("overview.uploadFailedPrefix") + localizedError(e, translate));
+      toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
       setUploading(false);
     }
   }
@@ -451,7 +428,7 @@ function DraftChat({
   const agentPicker = (
     <Select value={agentKey} onValueChange={setAgentKey}>
       <SelectTrigger className="w-full sm:w-40">
-        <SelectValue placeholder={translate("overview.chooseAgent")} />
+        <SelectValue placeholder={t("Select an agent…")} />
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
@@ -459,10 +436,10 @@ function DraftChat({
             <SelectItem key={a.key} value={a.key}>
               <span className="flex items-center gap-2">
                 <Bot className="size-3.5" />
-                {agentDisplayName(a, translate)}
+                {a.name}
                 {!a.builtin && (
                   <Badge variant="outline" className="px-1 py-0 text-[9px]">
-                    {translate("overview.custom")}
+                    {t("Custom")}
                   </Badge>
                 )}
               </span>
@@ -481,7 +458,7 @@ function DraftChat({
           <Bot className="text-primary size-6" />
         </div>
         <div className="text-sm font-medium">
-          {translate("overview.startChat", { name: agent ? agentDisplayName(agent, translate) : "Agent" })}
+          {t('Start a conversation with "{name}"', { name: agent?.name ?? t("Agent") })}
         </div>
         {agent?.description && <p className="text-muted-foreground max-w-md text-xs">{agent.description}</p>}
       </div>
@@ -491,7 +468,7 @@ function DraftChat({
         onChange={setInput}
         onSend={send}
         disabled={sending || uploading || !agentKey}
-        placeholder={translate("overview.messagePlaceholder")}
+        placeholder={t("Type a message, @ to reference records, Enter to send")}
         leftSlot={agentPicker}
         onPickFiles={pickFiles}
         uploading={uploading}
@@ -526,14 +503,13 @@ function ChatView({
   onTitleMaybeChanged: () => void;
   onConvUpdated: () => void;
 }) {
-  const { t: translate } = useLiveTranslation();
   const approvalFocus = useApprovalFocus({ conversationId: conv.id });
   const [messages, setMessages] = React.useState<Activity[]>([]);
   const [running, setRunning] = React.useState(false);
   const [input, setInput] = React.useState(initial?.input ?? "");
   const [sending, setSending] = React.useState(false);
   const [stopping, setStopping] = React.useState(false);
-  // 方式1 文件上传:已上传的附件(落到 sessions/conv-<id>/uploads/),随下条消息一起发。
+  // Upload method 1: already-uploaded attachments (stored under sessions/conv-<id>/uploads/) are sent with the next message.
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>(initial?.attachments ?? []);
   const [uploading, setUploading] = React.useState(false);
   const cursorRef = React.useRef(0); // newest loaded id — incremental-tail anchor
@@ -551,7 +527,7 @@ function ChatView({
       await api.updateConversationProfile(conv.id, id);
       onConvUpdated();
     } catch (e) {
-      toast.error(translate("overview.switchProfileFailedPrefix") + localizedError(e, translate));
+      toast.error(t("Failed to switch LLM: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -640,23 +616,14 @@ function ChatView({
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 
-  const loadFocusPage = React.useCallback(
-    (before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE),
-    [conv.id],
-  );
+  const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
     setMessages((prev) => mergeActivities(page.items, prev));
     earliestRef.current = page.items[0]?.seq ?? earliestRef.current;
     hasMoreRef.current = page.hasMore;
     setHasMore(page.hasMore);
   }, []);
-  const focusHistory = useApprovalHistory(
-    approvalFocus.state?.source,
-    historyLoaded,
-    messages,
-    loadFocusPage,
-    mergeFocusPage,
-  );
+  const focusHistory = useApprovalHistory(approvalFocus.state?.source, historyLoaded, messages, loadFocusPage, mergeFocusPage);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -729,7 +696,7 @@ function ChatView({
     let li = 0,
       lo = 0,
       lcr = 0;
-    let turns = 0; // agent 循环轮次 = 模型调用次数（每次一条 kind='usage'）
+    let turns = 0; // agent loop turns = model call count (one kind='usage' entry each)
     for (const a of messages) {
       if (a.kind === "result") {
         i += a.input_tokens ?? 0;
@@ -758,7 +725,7 @@ function ChatView({
       const r = await api.chatUpload("session", `conv-${conv.id}`, files);
       setAttachments((prev) => [...prev, ...r.attachments]);
     } catch (e) {
-      toast.error(translate("overview.uploadFailedPrefix") + localizedError(e, translate));
+      toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
     } finally {
       setUploading(false);
     }
@@ -778,7 +745,7 @@ function ChatView({
       // fetch avoids racing a separate post-send request against the poller.
       setRunning(true);
     } catch (e) {
-      toast.error(translate("overview.sendFailedPrefix") + localizedError(e, translate));
+      toast.error(t("Send failed: {error}", { error: (e as Error).message }));
       setInput(msg); // restore so the user doesn't lose their text
       setAttachments(atts); // and their attachments
     } finally {
@@ -795,20 +762,14 @@ function ChatView({
     try {
       await api.stopConversation(conv.id);
     } catch (e) {
-      toast.error(translate("overview.stopFailedPrefix") + localizedError(e, translate));
+      toast.error(t("Stop failed: {error}", { error: (e as Error).message }));
     } finally {
       setStopping(false);
     }
   }
 
   return (
-    <SideQuestionWorkspace
-      side={side}
-      label={agent?.name ?? conv.agent_key}
-      composerLayout="inline"
-      noSnapshotHint={translate("overview.sideQuestionUnavailable")}
-      emptyDescription={translate("overview.sideQuestionHelp")}
-    >
+    <SideQuestionWorkspace side={side} label={agent?.name ?? conv.agent_key} composerLayout="inline">
       {/* header: which agent + live + token meta */}
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-b px-4 py-2.5">
         <Bot className="text-muted-foreground size-4 shrink-0" />
@@ -816,7 +777,7 @@ function ChatView({
         <span className="text-muted-foreground hidden shrink-0 font-mono text-xs sm:inline">{conv.agent_key}</span>
         {agent && !agent.builtin && (
           <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
-            {translate("overview.custom")}
+            {t("Custom")}
           </Badge>
         )}
         {agent?.description && (
@@ -826,13 +787,17 @@ function ChatView({
         <SideQuestionButton side={side} />
         <div className="text-muted-foreground ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs max-sm:w-full max-sm:flex-wrap">
           {tokenTotal.turns > 0 && (
-            <span title={translate("overview.roundsHint")} className="tabular-nums">
-              {translate("overview.rounds", { count: tokenTotal.turns })}
+            <span title={t("Agent loop turns (model calls)")} className="tabular-nums">
+              {t("{count} turns", { count: tokenTotal.turns })}
             </span>
           )}
           {tokenTotal.any && (
-            <span title="input / cache(read) / output tokens" className="min-w-0 truncate tabular-nums">
-              input {fmtTokens(tokenTotal.i)} · cache {fmtTokens(tokenTotal.cr)} · output {fmtTokens(tokenTotal.o)}
+            <span title={t("input / cache(read) / output tokens")} className="min-w-0 truncate tabular-nums">
+              {t("input {input} · cache {cache} · output {output}", {
+                input: fmtTokens(tokenTotal.i),
+                cache: fmtTokens(tokenTotal.cr),
+                output: fmtTokens(tokenTotal.o),
+              })}
             </span>
           )}
         </div>
@@ -845,22 +810,14 @@ function ChatView({
         <div className="min-w-0 max-w-full px-4 py-3" ref={contentRef}>
           {messages.length === 0 && !running ? (
             <div className="text-muted-foreground py-10 text-center text-sm">
-              {translate("overview.startChat", { name: agent?.name ?? conv.agent_key })}
+              {t('Start a conversation with "{name}"', { name: agent?.name ?? conv.agent_key })}
             </div>
           ) : (
             <>
               {hasMore && (
-                <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">
-                  {translate("overview.olderMessages")}
-                </div>
+                <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">{t("Scroll up to load earlier messages…")}</div>
               )}
-              <Transcript
-                activity={messages}
-                live={running}
-                chat
-                fetchDetail={fetchDetail}
-                focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
-              />
+              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
             </>
           )}
         </div>
@@ -872,7 +829,11 @@ function ChatView({
         onSend={send}
         disabled={running || sending}
         allowBtw
-        placeholder={running ? translate("overview.runningPlaceholder") : translate("overview.messagePlaceholder")}
+        placeholder={
+          running
+            ? t("Agent is replying; type /btw to ask a side question…")
+            : t("Type a message, @ to reference records, Enter to send")
+        }
         running={running}
         onStop={stop}
         stopDisabled={stopping}
@@ -930,7 +891,6 @@ const ConversationItem = React.memo(function ConversationItem({
   selectedForDelete: boolean;
   onSelectedForDeleteChange: (id: number, checked: boolean) => void;
 }) {
-  const { t: translate, i18n } = useLiveTranslation();
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const renameInputRef = React.useRef<HTMLInputElement>(null);
   const cancelRenameRef = React.useRef(false);
@@ -954,9 +914,7 @@ const ConversationItem = React.memo(function ConversationItem({
         <Checkbox
           checked={selectedForDelete}
           onCheckedChange={(checked) => onSelectedForDeleteChange(conv.id, checked === true)}
-          aria-label={translate("overview.selectConversation", {
-            title: conv.title || translate("overview.newConversation"),
-          })}
+          aria-label={t('Select conversation "{title}"', { title: conv.title || t("New conversation") })}
           className="ml-1 shrink-0"
         />
       )}
@@ -983,16 +941,16 @@ const ConversationItem = React.memo(function ConversationItem({
           type="button"
           onClick={() => onSelect(conv.id)}
           onDoubleClick={() => onStartRename(conv)}
-          title={translate("overview.renameHint")}
+          title={t("Double-click to rename")}
           className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left"
         >
           <div className="flex min-w-0 items-center gap-1.5">
-            {pinned && <PinIcon className="text-primary size-3 shrink-0" aria-label={translate("overview.pinned")} />}
-            <div className="truncate text-sm">{conv.title || translate("overview.newConversation")}</div>
+            {pinned && <PinIcon className="text-primary size-3 shrink-0" aria-label={t("Pinned")} />}
+            <div className="truncate text-sm">{conv.title || t("New conversation")}</div>
             {conv.running ? (
-              <Badge variant="secondary" className="shrink-0 gap-1" title={translate("overview.agentRunning")}>
+              <Badge variant="secondary" className="shrink-0 gap-1" title={t("Agent is running")}>
                 <Spinner className="size-3" aria-hidden="true" />
-                {translate("overview.running")}
+                {t("Running")}
               </Badge>
             ) : null}
           </div>
@@ -1005,7 +963,7 @@ const ConversationItem = React.memo(function ConversationItem({
               </>
             )}
             <span className="shrink-0">
-              {new Date(conv.created_at).toLocaleDateString(i18n.resolvedLanguage, {
+              {new Date(conv.created_at).toLocaleDateString(intlLocale, {
                 month: "numeric",
                 day: "numeric",
                 hour: "2-digit",
@@ -1022,9 +980,7 @@ const ConversationItem = React.memo(function ConversationItem({
             variant="ghost"
             size="icon-sm"
             className="text-muted-foreground shrink-0"
-            aria-label={translate("overview.manageConversation", {
-              title: conv.title || translate("overview.newConversation"),
-            })}
+            aria-label={t('Manage conversation "{title}"', { title: conv.title || t("New conversation") })}
           >
             <MoreHorizontalIcon />
           </Button>
@@ -1033,18 +989,18 @@ const ConversationItem = React.memo(function ConversationItem({
           <DropdownMenuGroup>
             <DropdownMenuItem onSelect={() => onStartRename(conv)}>
               <PencilIcon />
-              {translate("overview.rename")}
+              {t("Rename")}
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => onTogglePinned(conv)}>
               {pinned ? <PinOffIcon /> : <PinIcon />}
-              {pinned ? translate("overview.unpin") : translate("overview.pin")}
+              {pinned ? t("Unpin") : t("Pin")}
             </DropdownMenuItem>
           </DropdownMenuGroup>
           <DropdownMenuSeparator />
           <DropdownMenuGroup>
             <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
               <Trash2Icon />
-              {translate("overview.delete")}
+              {t("Delete")}
             </DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>
@@ -1053,13 +1009,13 @@ const ConversationItem = React.memo(function ConversationItem({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {translate("overview.deleteConversation", { title: conv.title || translate("overview.newConversation") })}
+              {t('Delete conversation "{title}"?', { title: conv.title || t("New conversation") })}
             </AlertDialogTitle>
-            <AlertDialogDescription>{translate("overview.irreversible")}</AlertDialogDescription>
+            <AlertDialogDescription>{t("This action cannot be undone.")}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{translate("overview.cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={() => onDelete(conv.id)}>{translate("overview.delete")}</AlertDialogAction>
+            <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => onDelete(conv.id)}>{t("Delete")}</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -1080,17 +1036,12 @@ function AgentGroupHeader({
   hasActive: boolean;
   onToggle: (key: string) => void;
 }) {
-  const { t: translate } = useLiveTranslation();
   return (
     <button
       type="button"
       onClick={() => onToggle(group.key)}
       aria-expanded={!collapsed}
-      title={
-        collapsed
-          ? translate("overview.expandGroup", { name: group.name })
-          : translate("overview.collapseGroup", { name: group.name })
-      }
+      title={collapsed ? t('Expand "{name}"', { name: group.name }) : t('Collapse "{name}"', { name: group.name })}
       className={cn(
         "sticky top-0 z-10 flex min-w-0 items-center gap-1.5 rounded-md bg-card px-1.5 py-1 text-left font-medium text-[11px] transition-colors hover:bg-accent/50",
         collapsed && hasActive ? "text-foreground" : "text-muted-foreground",
@@ -1100,16 +1051,10 @@ function AgentGroupHeader({
       <Bot className="size-3 shrink-0" />
       <span className="min-w-0 flex-1 truncate">{group.name}</span>
       {collapsed && hasActive && (
-        <span
-          className="size-1.5 shrink-0 rounded-full bg-primary"
-          title={translate("overview.activeConversationGroup")}
-        />
+        <span className="size-1.5 shrink-0 rounded-full bg-primary" title={t("The current conversation is in this group")} />
       )}
       {group.runningCount > 0 && (
-        <Spinner
-          className="size-3 shrink-0"
-          aria-label={translate("overview.runningConversations", { count: group.runningCount })}
-        />
+        <Spinner className="size-3 shrink-0" aria-label={t("{count} conversations running", { count: group.runningCount })} />
       )}
       <span className="shrink-0 tabular-nums opacity-60">{group.conversations.length}</span>
     </button>
@@ -1117,7 +1062,6 @@ function AgentGroupHeader({
 }
 
 export default function ChatPage() {
-  const { t: translate } = useLiveTranslation();
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [convs, setConvs] = React.useState<Conversation[]>([]);
@@ -1125,24 +1069,21 @@ export default function ChatPage() {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
-  const selectConversation = React.useCallback(
-    (id: number | null) => {
-      if (id !== selectedId) {
-        const url = new URL(window.location.href);
-        url.searchParams.delete("approval");
-        setSourceRequested(false);
-        window.history.replaceState(null, "", url);
-      }
-      setSelectedId(id);
-    },
-    [selectedId],
-  );
+  const selectConversation = React.useCallback((id: number | null) => {
+    if (id !== selectedId) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("approval");
+      setSourceRequested(false);
+      window.history.replaceState(null, "", url);
+    }
+    setSelectedId(id);
+  }, [selectedId]);
 
   const [renamingId, setRenamingId] = React.useState<number | null>(null);
   const [renameText, setRenameText] = React.useState("");
   const [selectedConversationIds, setSelectedConversationIds] = React.useState<Set<number>>(() => new Set());
   // selectionMode gates the multi-select UI: off by default (clean list, no
-  // checkboxes); the header "多选" button turns it on, "完成" turns it off and
+  // checkboxes); the header "Select" button turns it on, "Done" turns it off and
   // clears the selection.
   const [selectionMode, setSelectionMode] = React.useState(false);
   const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
@@ -1163,10 +1104,7 @@ export default function ChatPage() {
     const seq = ++conversationListSeq.current;
     try {
       const items = await api.conversations();
-      if (seq === conversationListSeq.current) {
-        setConvs(items);
-        setConvsLoaded(true);
-      }
+      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
     } catch {
       // Preserve the selected transcript and list on a transient poll failure.
     }
@@ -1279,7 +1217,7 @@ export default function ChatPage() {
     [visibleConversations, agentByKey],
   );
   // conversation agents: custom agents + conversational built-ins (role=assistant,
-  // e.g. Auto / 渗透测试). The orchestration built-ins (goals/planner/mainagent/worker)
+  // e.g. Auto / penetration testing). The orchestration built-ins (goals/planner/mainagent/worker)
   // are task-specific and stay hidden from the chat page.
   const chatAgents = React.useMemo(() => agents.filter((a) => !a.builtin || a.role === "assistant"), [agents]);
   const agentFilterOptions = React.useMemo(() => {
@@ -1292,12 +1230,10 @@ export default function ChatPage() {
     if (agentFilter !== null) keys.add(agentFilter);
     return [...keys]
       .map((key) => ({ key, name: agentByKey.get(key)?.name || key, count: counts.get(key) ?? 0 }))
-      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+      .sort((a, b) => a.name.localeCompare(b.name, intlLocale));
   }, [convs, chatAgents, agentByKey, agentFilter]);
   const conversationCountLabel =
-    agentFilter === null
-      ? translate("overview.totalConversations", { count: convs.length })
-      : translate("overview.filteredConversations", { visible: filteredConversations.length, total: convs.length });
+    agentFilter === null ? t("{count} total", { count: convs.length }) : `${filteredConversations.length} / ${convs.length}`;
 
   function changeAgentFilter(key: string | null) {
     setAgentFilter(key);
@@ -1348,10 +1284,10 @@ export default function ChatPage() {
         });
         void reloadConvs();
       } catch (e) {
-        toast.error(translate("overview.deleteFailedPrefix") + localizedError(e, translate));
+        toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
       }
     },
-    [reloadConvs, translate],
+    [reloadConvs],
   );
 
   async function deleteSelectedConversations() {
@@ -1365,7 +1301,7 @@ export default function ChatPage() {
         const result = await api.deleteConversations(ids.slice(offset, offset + 100));
         for (const item of result.items) {
           if (item.ok) deleted.add(item.id);
-          else failed.push({ id: item.id, error: item.error ?? translate("overview.conversationNotFound") });
+          else failed.push({ id: item.id, error: item.error ?? t("conversation not found") });
         }
       }
       if (deleted.has(selectedId ?? -1)) selectConversation(null);
@@ -1374,17 +1310,16 @@ export default function ChatPage() {
         for (const id of deleted) next.delete(id);
         return next;
       });
-      if (deleted.size > 0) toast.success(translate("overview.conversationsDeleted", { count: deleted.size }));
+      if (deleted.size > 0) toast.success(t("Deleted {count} conversations", { count: deleted.size }));
       if (failed.length > 0) {
         const details = failed
           .slice(0, 3)
-          .map((item) => `#${item.id}（${item.error}）`)
-          .join("；");
+          .map((item) => `#${item.id} (${item.error})`)
+          .join("; ");
         toast.error(
-          translate("overview.conversationsDeleteFailed", {
+          t("Failed to delete {count} conversations: {details}", {
             count: failed.length,
-            details: details,
-            more: failed.length > 3 ? translate("overview.moreSuffix") : "",
+            details: failed.length > 3 ? t("{items} etc.", { items: details }) : details,
           }),
         );
       }
@@ -1394,7 +1329,7 @@ export default function ChatPage() {
       if (failed.length === 0) setSelectionMode(false);
       void reloadConvs();
     } catch (error) {
-      toast.error(translate("overview.bulkDeleteFailed", { message: localizedError(error, translate) }));
+      toast.error(t("Bulk delete failed: {error}", { error: (error as Error).message }));
       void reloadConvs();
     } finally {
       setBulkDeleting(false);
@@ -1408,15 +1343,11 @@ export default function ChatPage() {
         await api.pinConversation(conversation.id, !pinned);
         void reloadConvs();
       } catch (e) {
-        toast.error(
-          translate("overview.pinFailed", {
-            action: translate(pinned ? "overview.unpin" : "overview.pin"),
-            message: localizedError(e, translate),
-          }),
-        );
+        const error = (e as Error).message;
+        toast.error(pinned ? t("Failed to unpin: {error}", { error }) : t("Failed to pin: {error}", { error }));
       }
     },
-    [reloadConvs, translate],
+    [reloadConvs],
   );
 
   const startRename = React.useCallback((c: Conversation) => {
@@ -1432,10 +1363,10 @@ export default function ChatPage() {
         await api.renameConversation(id, title);
         void reloadConvs();
       } catch (e) {
-        toast.error(translate("overview.renameFailedPrefix") + localizedError(e, translate));
+        toast.error(t("Rename failed: {error}", { error: (e as Error).message }));
       }
     },
-    [reloadConvs, translate],
+    [reloadConvs],
   );
   const cancelRename = React.useCallback(() => setRenamingId(null), []);
 
@@ -1449,24 +1380,23 @@ export default function ChatPage() {
         <div className="bg-card flex flex-col overflow-hidden rounded-lg border">
           <div className="flex flex-col gap-2 border-b p-2">
             <Button size="sm" className="w-full" onClick={() => selectConversation(null)}>
-              <PlusIcon />
-              {translate("overview.createConversation")}
+              <PlusIcon /> {t("New conversation")}
             </Button>
             <Select
               value={agentFilter === null ? "all" : `agent:${agentFilter}`}
               onValueChange={(value) => changeAgentFilter(value === "all" ? null : value.slice(6))}
               disabled={bulkDeleting}
             >
-              <SelectTrigger size="sm" className="w-full min-w-0" aria-label={translate("overview.filterAgents")}>
+              <SelectTrigger size="sm" className="w-full min-w-0" aria-label={t("Filter conversations by agent")}>
                 <Bot />
-                <SelectValue placeholder={translate("overview.allAgents")} />
+                <SelectValue placeholder={t("All agents")} />
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value="all">{translate("overview.allAgents")}</SelectItem>
+                  <SelectItem value="all">{t("All agents")}</SelectItem>
                   {agentFilterOptions.map((agent) => (
                     <SelectItem key={agent.key} value={`agent:${agent.key}`}>
-                      {agentDisplayName(agent, translate)} ({agent.count})
+                      {agent.name} ({agent.count})
                     </SelectItem>
                   ))}
                 </SelectGroup>
@@ -1478,12 +1408,12 @@ export default function ChatPage() {
                   <Checkbox
                     checked={conversationHeaderChecked}
                     onCheckedChange={(checked) => toggleAllConversations(checked === true)}
-                    aria-label={translate("overview.selectFilteredConversations")}
+                    aria-label={t("Select all conversations matching the current filter")}
                     disabled={filteredConversations.length === 0 || bulkDeleting}
                   />
                   <span className="text-muted-foreground min-w-0 flex-1 text-xs tabular-nums">
                     {selectedConversationCount > 0
-                      ? translate("overview.selectedConversations", { count: selectedConversationCount })
+                      ? t("{count} selected", { count: selectedConversationCount })
                       : conversationCountLabel}
                   </span>
                   {selectedConversationCount > 0 && (
@@ -1494,11 +1424,11 @@ export default function ChatPage() {
                       onClick={() => setBulkDeleteOpen(true)}
                     >
                       <Trash2Icon data-icon="inline-start" />
-                      {translate("overview.delete")}
+                      {t("Delete")}
                     </Button>
                   )}
                   <Button size="sm" variant="ghost" onClick={exitSelectionMode}>
-                    {translate("overview.done")}
+                    {t("Done")}
                   </Button>
                 </div>
               ) : (
@@ -1514,7 +1444,7 @@ export default function ChatPage() {
                     disabled={filteredConversations.length === 0}
                   >
                     <ListChecksIcon data-icon="inline-start" />
-                    {translate("overview.selectMultiple")}
+                    {t("Select")}
                   </Button>
                 </div>
               ))}
@@ -1527,9 +1457,7 @@ export default function ChatPage() {
             <div className="flex min-w-0 flex-col gap-0.5 p-2">
               {filteredConversations.length === 0 && (
                 <p className="text-muted-foreground px-2 py-6 text-center text-xs">
-                  {agentFilter === null
-                    ? translate("overview.emptyConversations")
-                    : translate("overview.emptyAgentConversations")}
+                  {agentFilter === null ? t("No conversations yet") : t("No conversations for this agent")}
                 </p>
               )}
               {pinnedConversations.map((c) => (
@@ -1595,7 +1523,7 @@ export default function ChatPage() {
                   className="mt-1 w-full"
                   onClick={() => setVisibleConversationCount((count) => count + CONVERSATION_LIST_PAGE)}
                 >
-                  {translate("overview.loadMore")}
+                  {t("Load more")}
                 </Button>
               )}
             </div>
@@ -1616,7 +1544,7 @@ export default function ChatPage() {
             />
           ) : sourceRequested ? (
             <div role="status" className="p-6 text-sm text-muted-foreground">
-              {convsLoaded ? translate("overview.conversationDeleted") : translate("overview.loadingConversation")}
+              {convsLoaded ? t("The conversation has been deleted") : t("Loading the conversation…")}
             </div>
           ) : (
             <DraftChat
@@ -1645,12 +1573,14 @@ export default function ChatPage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {translate("overview.deleteSelected", { count: selectedConversationCount })}
+              {t("Delete {count} selected conversations?", { count: selectedConversationCount })}
             </AlertDialogTitle>
-            <AlertDialogDescription>{translate("overview.deleteConversationHelp")}</AlertDialogDescription>
+            <AlertDialogDescription>
+              {t("Conversation messages and execution records will be deleted with them. This action cannot be undone.")}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={bulkDeleting}>{translate("overview.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel disabled={bulkDeleting}>{t("Cancel")}</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={bulkDeleting || selectedConversationCount === 0}
@@ -1660,7 +1590,7 @@ export default function ChatPage() {
               }}
             >
               {bulkDeleting && <Loader2Icon data-icon="inline-start" className="animate-spin" />}
-              {bulkDeleting ? translate("overview.deleting") : translate("overview.confirmDelete")}
+              {bulkDeleting ? t("Deleting") : t("Confirm delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

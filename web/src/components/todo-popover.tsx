@@ -1,12 +1,10 @@
 "use client";
 
 import * as React from "react";
-
 import { ListTodo } from "lucide-react";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { localizedError } from "@/i18n/errors";
-import { useLiveTranslation } from "@/i18n/use-live-translation";
+import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 // TodoPopover shows the latest TodoWrite state of a session (chat conversation or
@@ -21,7 +19,6 @@ export function TodoPopover({
   seq: number | null;
   fetchDetail: (seq: number) => Promise<string>;
 }) {
-  const { t: translate } = useLiveTranslation();
   const [open, setOpen] = React.useState(false);
   const [todos, setTodos] = React.useState<{ content: string; status: string }[] | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -33,11 +30,11 @@ export function TodoPopover({
     setErr("");
     try {
       const detail = await fetchDetail(seq);
-      const start = detail.indexOf("{"); // detail 可能带 "TodoWrite " 前缀
+      const start = detail.indexOf("{"); // detail may carry a "TodoWrite " prefix
       const parsed = JSON.parse(start >= 0 ? detail.slice(start) : detail);
       setTodos(Array.isArray(parsed?.todos) ? parsed.todos : []);
     } catch {
-      setErr("chatUI.todoParseFailed");
+      setErr(t("Failed to parse todos"));
       setTodos(null);
     } finally {
       setLoading(false);
@@ -46,7 +43,7 @@ export function TodoPopover({
 
   // refetch on each open — todos change as the run progresses.
   React.useEffect(() => {
-    if (open) void load();
+    if (open) load();
   }, [open, load]);
 
   const disabled = seq == null;
@@ -57,33 +54,30 @@ export function TodoPopover({
         <button
           type="button"
           disabled={disabled}
-          title={disabled ? translate("chatUI.noTodo") : translate("chatUI.recentTodoHint")}
+          title={disabled ? t("No todos in this session") : t("View latest todos")}
           className="text-muted-foreground/70 hover:text-primary flex items-center gap-0.5 text-xs disabled:pointer-events-none disabled:opacity-40"
         >
           <ListTodo className="size-3" />
-          Todo
+          {t("Todo")}
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="max-h-80 w-80 overflow-auto p-2">
         <p className="text-muted-foreground px-1 pb-1 text-[11px] font-medium">
-          {translate("chatUI.recentTodo")}
-          {loading ? translate("chatUI.todoLoading") : ""}
+          {t("Latest todos")}
+          {loading ? ` · ${t("Loading…")}` : ""}
         </p>
-        {err && <p className="text-destructive px-1 text-xs">{localizedError(err, translate)}</p>}
+        {err && <p className="text-destructive px-1 text-xs">{err}</p>}
         {todos && todos.length === 0 && !loading && (
-          <p className="text-muted-foreground px-1 text-xs">{translate("chatUI.empty")}</p>
+          <p className="text-muted-foreground px-1 text-xs">{t("(empty)")}</p>
         )}
         <ul className="space-y-0.5">
-          {(todos ?? []).map((t, i) => (
+          {(todos ?? []).map((todo, i) => (
             <li
-              key={`${i}:${t.content}`}
-              className={cn(
-                "flex gap-1.5 px-1 text-xs",
-                t.status === "completed" && "text-muted-foreground line-through",
-              )}
+              key={`${i}:${todo.content}`}
+              className={cn("flex gap-1.5 px-1 text-xs", todo.status === "completed" && "text-muted-foreground line-through")}
             >
-              <span className="shrink-0">{MARK[t.status] ?? "☐"}</span>
-              <span className="break-words">{t.content}</span>
+              <span className="shrink-0">{MARK[todo.status] ?? "☐"}</span>
+              <span className="break-words">{todo.content}</span>
             </li>
           ))}
         </ul>
